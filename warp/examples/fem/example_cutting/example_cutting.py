@@ -6,7 +6,7 @@
 #     "kaolin==0.17.0",
 #     "polyscope==2.1",
 #     "torch==2.5.1",
-#     "warp-lang>=1.9.0dev20250801",
+#     "warp-lang==1.9.0dev20250801",
 #     "torchvision",
 #     "trimesh",
 #     "meshio",
@@ -53,15 +53,28 @@ import warp as wp
 import warp.fem as fem
 
 
+def debug_print(*values):
+    if getattr(globals().get("args", None), "debug", False):
+        print("[debug]", *values, flush=True)
+
+
 def load_normalized_mesh(path):
     """Load and normalize an obj mesh from path"""
 
     from warp.sim.utils import load_mesh
 
+    debug_print(f"Loading mesh from {path!r}")
     points, indices = load_mesh(path)
     bbox_min, bbox_max = (
         np.min(points, axis=0),
         np.max(points, axis=0),
+    )
+    debug_print(
+        "Loaded mesh:",
+        f"vertices={points.shape[0]}",
+        f"triangles={len(indices) // 3}",
+        f"bbox_min={bbox_min}",
+        f"bbox_max={bbox_max}",
     )
     normalized_vertices = (2.0 * points - bbox_min - bbox_max) / np.max(bbox_max - bbox_min + 0.001)
     return wp.Mesh(
@@ -126,6 +139,57 @@ def world_to_rest_pose_kernel(
 
 
 @wp.kernel
+def closest_face_vertex_kernel(
+    mesh: wp.uint64,
+    pos: wp.vec3,
+    max_dist: float,
+    out_face: wp.array(dtype=int),
+    out_vertex: wp.array(dtype=int),
+    out_bary: wp.array(dtype=wp.vec3),
+):
+    """Locate the closest surface face and store its index, the index of the closest corner vertex, and the barycentric coordinates of the closest point on the triangle.
+    
+    Args: 
+        mesh: the mesh to query
+        pos: the position to query 
+        max_dist: the maximum distance from position to search for a closest face
+        out_face: the index of the closest triangle face 
+        out_vertex: the index of the closest corner vertex
+        out_bary: the barycentric coordinates of the closest point on the triangle to pos
+
+    Returns:
+        None, but sets out_face, out_vertex and out_bary. 
+    """
+
+    # locate the closest surface face
+    # query.face is the index of the closest triangle face
+    # query.u and query.v are barycentric coordinates of the closest point on the triangle 
+    query = wp.mesh_query_point_no_sign(mesh, pos, max_dist)
+
+    if query.result:
+        w0 = 1.0 - query.u - query.v # compute weights for the closest corner vertex
+        w1 = query.u
+        w2 = query.v
+
+        local_vertex = 0
+        largest_weight = w0
+        if w1 > largest_weight:
+            local_vertex = 1
+            largest_weight = w1
+        if w2 > largest_weight:
+            local_vertex = 2 # index of the closest corner vertex
+
+        faces = wp.mesh_get(mesh).indices # array of triangle indices, ie each set of 3 indices is a triangle 
+        out_face[0] = query.face # index of the closest triangle face
+        out_vertex[0] = faces[3 * query.face + local_vertex] # index of the closest corner vertex
+        out_bary[0] = wp.vec3(w0, w1, w2) # the barycentric coordindates of the closest point on the triangle 
+    else:
+        out_face[0] = -1 # no closest face found
+        out_vertex[0] = -1
+        out_bary[0] = wp.vec3(0.0)
+
+
+@wp.kernel
 def sculpt_sdf(
     amount: float,
     falloff: float,
@@ -178,6 +242,13 @@ class Clay:
 
     def create_sim(self, flexicubes, sim_class):
         prev_sim = self.sim
+        debug_print(
+            "Creating simulation:",
+            f"sim_class={sim_class.__name__}",
+            f"has_previous_sim={prev_sim is not None}",
+            f"surface_vertices={len(flexicubes.tri_vertices)}",
+            f"surface_faces={len(flexicubes.tri_faces)}",
+        )
 
         # (Re)create simulation
         self.sim = sim_from_flexicubes(
@@ -192,6 +263,7 @@ class Clay:
 
         # Interpolate back previous displacement
         if prev_sim is not None:
+            debug_print("Interpolating previous displacement and velocity onto rebuilt sim")
             new_domain = self.sim.u_test.domain
             prev_displacement_field = fem.NonconformingField(new_domain, prev_sim.u_field)
             prev_velocity_field = fem.NonconformingField(new_domain, prev_sim.du_field)
@@ -218,18 +290,23 @@ class Clay:
         self.collision_handler = MeshSelfCollisionHandler(self.surface_vtx_quadrature, self.tri_mesh)
         if not self.sim.args.matrix_free:
             # Matrix free sim does not handle collisions yet
+            debug_print("Adding self-collision potential")
             collision_potential = CollisionPotential(self.sim, self.collision_handler)
             self.sim.add_energy_potential(collision_potential)
+        else:
+            debug_print("Skipping self-collision potential for matrix-free sim")
 
         self.volumetric_forces = VolumetricForcePotential(self.sim, reserve_count=1)
         self.volumetric_forces.forces.radii.fill_(2.0 / res)
         self.sim.add_energy_potential(self.volumetric_forces)
+        debug_print("Simulation created")
 
     def is_initialized(self):
         return self._sim_initialized
 
     def ensure_sim_is_initialized(self):
         if not self._sim_initialized:
+            debug_print("Initializing simulation constant forms")
             self.sim.set_fixed_points_condition(
                 fixed_points_projector_form,
                 {
@@ -241,6 +318,7 @@ class Clay:
             self.sim.init_constant_forms()
             self.sim.project_constant_forms()
             self._sim_initialized = True
+            debug_print("Simulation constant forms initialized")
 
     def world_to_rest_pos(self, world_pos):
         tri_mesh = self.tri_mesh
@@ -254,8 +332,130 @@ class Clay:
         )
         return rest_pos
 
+    def duplicate_nearest_surface_vertex(self, flexicubes, world_pos, world_ray, max_dist):
+        tri_mesh = self.tri_mesh # the triangle mesh to query 
+        tri_mesh.refit() # update the triangle mesh to the current deformation (used to update vertex positions, not topology)
 
-def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.array):
+        picked_face = wp.empty(1, dtype=int) # storage for the index of the closest triangle face
+        picked_vertex = wp.empty(1, dtype=int) # storage for the index of the closest vertex on the triangle 
+        picked_bary = wp.empty(1, dtype=wp.vec3) # storage for the barycentric coordinates of the closest point on the triangle 
+        
+        # launch the kernel to locate the closest triangle face and vertex
+        wp.launch(
+            closest_face_vertex_kernel,
+            dim=1,
+            inputs=[
+                tri_mesh.id,
+                wp.vec3(float(world_pos[0]), float(world_pos[1]), float(world_pos[2])),
+                max_dist,
+                picked_face,
+                picked_vertex,
+                picked_bary,
+            ],
+        )
+
+        face_id = int(picked_face.numpy()[0]) # convert to integer
+        vertex_id = int(picked_vertex.numpy()[0])
+
+        print(f"face_id={face_id}, vertex_id={vertex_id}")
+        if face_id < 0 or vertex_id < 0: # if no closest face or vertex was found, return False
+            debug_print("Cut pick missed:", f"world_pos={world_pos}", f"max_dist={max_dist}")
+            return False
+
+        faces = np.array(flexicubes.tri_faces, copy=True) # an array of triangle indices (so each set of 3 indices is a triangle)
+        vertices = np.array(flexicubes.tri_vertices, copy=True) # an array of vertex positions
+        deformed_vertices = tri_mesh.points.numpy() # an array of deformed vertex positions
+
+
+        # get the faces where the vertex we want to duplicate is a vertex 
+        # then return the indices of these faces
+        incident_faces = np.flatnonzero(np.any(faces == vertex_id, axis=1)) # returns indices of the faces that contain the vertex we want to duplicate 
+        if incident_faces.shape[0] < 2: # if we have less than 2 indicent faces return False (this would mean we are trying to duplicate a vertex that is not on the surface)
+            debug_print(
+                "Cut pick rejected:",
+                f"face_id={face_id}",
+                f"vertex_id={vertex_id}",
+                f"incident_faces={incident_faces.shape[0]}",
+            )
+            return False
+
+        face_vertices = faces[face_id] # get the vertices of the closest triangle face (x, y, z)
+        p0, p1, p2 = deformed_vertices[face_vertices] # these would be the positions of the vertices as they are deformed 
+        face_normal = np.cross(p1 - p0, p2 - p0) # cross product of two edges of the triangle to get the normal vector 
+        normal_norm = np.linalg.norm(face_normal) # magnitude of the normal vector
+        ray_norm = np.linalg.norm(world_ray) # magnitude of the ray direction
+        if normal_norm < 1.0e-8 or ray_norm < 1.0e-8: # if the normal vector/ray is too small, then we return false 
+            debug_print(
+                "Cut pick rejected due to degenerate direction:",
+                f"face_id={face_id}",
+                f"vertex_id={vertex_id}",
+                f"normal_norm={normal_norm}",
+                f"ray_norm={ray_norm}",
+            )
+            return False
+
+        face_normal /= normal_norm # normalize the normal vector 
+        ray_dir = world_ray / ray_norm # normalize the ray direction
+        cut_axis = np.cross(ray_dir, face_normal) # to get the axis we are slicing on 
+        axis_norm = np.linalg.norm(cut_axis) # magnitude of the cut axis (if small, this would mean that raydir and face normal are nearly parallel
+        if axis_norm < 1.0e-8: # if cut axis is too small... 
+            other_vertices = face_vertices[face_vertices != vertex_id] # get the other two vertices on the face
+            cut_axis = np.mean(deformed_vertices[other_vertices], axis=0) - deformed_vertices[vertex_id] # compute a vector of the vertex to the centroid of the other two vertices
+            axis_norm = np.linalg.norm(cut_axis) # magnitude of new cut axis
+            if axis_norm < 1.0e-8: # if too small
+                debug_print(
+                    "Cut pick rejected due to degenerate cut axis:",
+                    f"face_id={face_id}",
+                    f"vertex_id={vertex_id}",
+                )
+                return False
+        cut_axis /= axis_norm # normalize cut axis 
+
+        vertex_pos = deformed_vertices[vertex_id] # position of the vertex we want to duplicate 
+        duplicate_faces = []
+        original_faces = []
+        for incident_face in incident_faces: 
+            other_vertices = faces[incident_face][faces[incident_face] != vertex_id] # get the other two vertices on the given face
+            if other_vertices.shape[0] == 0:
+                continue
+
+            one_ring_centroid = np.mean(deformed_vertices[other_vertices], axis=0) # get the average position of the other two vertices on the face 
+            side = float(np.dot(one_ring_centroid - vertex_pos, cut_axis)) # get the signed distance from the vertex to the cut axis
+            if side >= 0.0: # if positive, it'll become a duplicate face
+                duplicate_faces.append(incident_face)
+            else: # if negative, it'll become an original face
+                original_faces.append(incident_face)
+
+        if not duplicate_faces or not original_faces:
+            print(f"duplicate_faces={duplicate_faces}", f"original_faces={original_faces}")
+            print("No duplicate or original faces found")
+            return False
+
+        new_vertex_id = vertices.shape[0] # one larger than the number of vertices in the mesh
+        vertices = np.vstack((vertices, vertices[vertex_id : vertex_id + 1])) # append the new vertex to the vertices array
+
+        duplicate_faces = np.array(duplicate_faces, dtype=int) # convert to numpy array
+        faces_to_update = faces[duplicate_faces] # get the (x, y, z) of the vertices to update to duplicate vertex
+        faces_to_update[faces_to_update == vertex_id] = new_vertex_id # change the new vertex to the duplicate vertex
+        faces[duplicate_faces] = faces_to_update # update the faces array to the new vertices 
+
+        flexicubes.tri_vertices = vertices # update the vertices
+        flexicubes.tri_faces = faces # update the faces
+        if flexicubes.vtx_displ is not None: # if there are displacement fields, append the new vertex to the displacement fields 
+            flexicubes.vtx_displ = np.vstack((flexicubes.vtx_displ, flexicubes.vtx_displ[vertex_id : vertex_id + 1]))
+
+        print(
+            "Duplicated surface vertex:",
+            f"old_vertex_id={vertex_id}",
+            f"new_vertex_id={new_vertex_id}",
+            f"picked_face={face_id}",
+            f"updated_faces={len(duplicate_faces)}",
+            f"total_vertices={vertices.shape[0]}",
+        )
+        return True
+
+
+def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.array, flexicubes):
     """Setups an interactive polyscope viewer and register hooks for sculpting and picking"""
 
     import polyscope as ps
@@ -273,15 +473,18 @@ def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.a
     prev_world_pos = None
     frame_id = 0
     force_center_quadrature = None
+    flexicubes_data = flexicubes
+    sculpt_rebuild_count = 0
 
     # user interface callback
     def callback():
-        nonlocal prev_world_pos, force_center_quadrature, frame_id
+        nonlocal prev_world_pos, force_center_quadrature, frame_id, flexicubes_data, sculpt_rebuild_count
 
         io = psim.GetIO()
 
         ctrl = getattr(psim, "ImGuiKeyModFlags_Ctrl", None) or psim.ImGuiModFlags_Ctrl
         shift = getattr(psim, "ImGuiKeyModFlags_Shift", None) or psim.ImGuiModFlags_Shift
+        alt = getattr(psim, "ImGuiKeyModFlags_Alt", None) or psim.ImGuiModFlags_Alt
 
         sculpting = False
         if io.KeyMods in (1, ctrl):
@@ -316,11 +519,45 @@ def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.a
                 )
 
                 # rebuilds flexicubes structure and recreate sim
-                fc_data = flexicubes_from_sdf_grid(res, grid_sdf, grid_node_pos)
-                clay.create_sim(fc_data, sim_class=sim_class)
-                register_ps_meshes(fc_data, clay.sim)
+                flexicubes_data = flexicubes_from_sdf_grid(res, grid_sdf, grid_node_pos)
+                sculpt_rebuild_count += 1
+                if sculpt_rebuild_count == 1 or sculpt_rebuild_count % 10 == 0:
+                    debug_print(
+                        "Sculpt rebuild:",
+                        f"count={sculpt_rebuild_count}",
+                        f"amount={amount}",
+                        f"rest_pos={rest_pos.numpy()[0]}",
+                        f"surface_vertices={len(flexicubes_data.tri_vertices)}",
+                        f"surface_faces={len(flexicubes_data.tri_faces)}",
+                    )
+                clay.create_sim(flexicubes_data, sim_class=sim_class)
+                register_ps_meshes(flexicubes_data, clay.sim)
 
                 io.WantCaptureMouse = True
+
+        if io.KeyMods in (4, alt):
+            print("Alt detected")
+            if io.MouseClicked[0]:
+                print("mouse clicked")
+                screen_coords = io.MousePos
+                world_pos = ps.screen_coords_to_world_position(screen_coords)
+                world_ray = ps.screen_coords_to_world_ray(screen_coords)
+
+                if np.all(np.isfinite(world_pos)) and np.all(np.isfinite(world_ray)):
+                    if clay.duplicate_nearest_surface_vertex(
+                        flexicubes_data,
+                        world_pos,
+                        world_ray,
+                        max_dist=args.cut_pick_radius,
+                    ):
+                        print("Cut succeeded; rebuilding simulation")
+                        clay.create_sim(flexicubes_data, sim_class=sim_class)
+                        register_ps_meshes(flexicubes_data, clay.sim)
+                        io.WantCaptureMouse = True
+                    else:
+                        print("Cut did not modify the mesh")
+                else:
+                    print("Cut click ignored because world position or ray was not finite")
 
         sim = clay.sim
 
@@ -361,6 +598,12 @@ def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.a
 
                 if np.all(np.isfinite(world_pos)):
                     rest_pos = clay.world_to_rest_pos(world_pos)
+                    debug_print(
+                        "Picking force started:",
+                        f"world_pos={world_pos}",
+                        f"rest_pos={rest_pos.numpy()[0]}",
+                        f"force_scale={args.force_scale}",
+                    )
 
                     # update force application point
                     clay.volumetric_forces.forces.count = 1
@@ -373,6 +616,7 @@ def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.a
                     force_center_quadrature._domain = sim.u_test.domain
 
                 else:
+                    debug_print("Picking force click ignored because world position was not finite")
                     clay.volumetric_forces.forces.count = 0
 
             elif clay.volumetric_forces.forces.count > 0:
@@ -404,6 +648,8 @@ def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.a
                 ps.get_curve_network("force_line").set_enabled(True)
 
             if io.MouseReleased[0]:
+                if clay.volumetric_forces.forces.count > 0:
+                    debug_print("Picking force released")
                 clay.volumetric_forces.forces.count = 0
                 ps.get_curve_network("force_line").set_enabled(False)
 
@@ -412,6 +658,7 @@ def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.a
     ps.init()
 
     ps.set_ground_plane_mode(mode_str="none")
+    debug_print("Polyscope initialized")
     ps.register_curve_network(
         "force_line",
         nodes=np.zeros((2, 3)),
@@ -419,10 +666,11 @@ def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.a
         enabled=False,
     )
 
-    register_ps_meshes(fc_data, clay.sim, first_frame=True)
+    register_ps_meshes(flexicubes_data, clay.sim, first_frame=True)
 
     # ps.set_build_default_gui_panels(False)
     ps.set_user_callback(callback)
+    debug_print("Starting interactive viewer")
     ps.show()
 
 
@@ -474,10 +722,29 @@ if __name__ == "__main__":
         default=0.9,
         help="Clamp points above this Y value",
     )
+    parser.add_argument(
+        "--cut_pick_radius",
+        type=float,
+        default=0.1,
+        help="Maximum world-space distance for Alt+left-click vertex-duplication cuts",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print setup and interaction details for debugging",
+    )
 
     sim_class.add_parser_arguments(parser)
     MeshSelfCollisionHandler.add_parser_arguments(parser)
     args = parser.parse_args(remaining_args)
+    debug_print(
+        "Parsed arguments:",
+        f"variant={class_args.variant}",
+        f"mesh={args.mesh}",
+        f"resolution={args.resolution}",
+        f"quadrature_model={args.quadrature_model}",
+        f"matrix_free={getattr(args, 'matrix_free', None)}",
+    )
 
     # fall back to full-cell quadrature if neural model not provided
     args.clip = False
@@ -488,23 +755,32 @@ if __name__ == "__main__":
 
     # Regular grid for evaluating sdf
     geo = fem.Grid3D(res=wp.vec3i(res), bounds_lo=wp.vec3(-1), bounds_hi=wp.vec3(1))
+    debug_print("Created grid:", f"resolution={res}", f"cell_count={res ** 3}")
 
     # sample mesh SDF on grid nodes
     source_mesh = load_normalized_mesh(args.mesh)
     grid_node_pos = fem.make_polynomial_space(geo).node_positions()
     grid_sdf = wp.empty(grid_node_pos.shape[0], dtype=float)
+    debug_print("Sampling mesh SDF:", f"grid_nodes={grid_node_pos.shape[0]}")
     wp.launch(
         mesh_sdf_kernel,
         dim=grid_node_pos.shape,
         inputs=[source_mesh.id, grid_node_pos, grid_sdf],
     )
+    debug_print("Finished sampling mesh SDF")
 
     # Create flexicube data from sdf grid
     fc_data = flexicubes_from_sdf_grid(res, grid_node_pos=grid_node_pos, grid_node_sdf=grid_sdf, sdf_grad_func=None)
+    debug_print(
+        "Created flexicubes:",
+        f"surface_vertices={len(fc_data.tri_vertices)}",
+        f"surface_faces={len(fc_data.tri_faces)}",
+    )
 
     # Create simulation
     clay = Clay(geo)
     clay.create_sim(fc_data, sim_class=sim_class)
 
     # Setup interactive viewer and run simulation
-    setup_interactive_viewer(clay, grid_node_pos, grid_sdf)
+    debug_print("Launching interactive viewer setup")
+    setup_interactive_viewer(clay, grid_node_pos, grid_sdf, fc_data)

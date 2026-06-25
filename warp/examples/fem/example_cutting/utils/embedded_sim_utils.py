@@ -89,7 +89,12 @@ def sim_from_flexicubes(
     clip_qp: bool = False,
     quadrature_order: int = 0,
 ):
-    """Instantiates a simulator instance from serialized Flexicubes data"""
+    """Instantiates a simulator instance from serialized Flexicubes data
+    
+    Args:
+
+    Returns:
+    """
 
     # Compute quadrature and active cells from flexicube sdf
     if quadrature_model:
@@ -102,6 +107,7 @@ def sim_from_flexicubes(
 
     quad_order = 2 * sim_args.degree if quadrature_order == 0 else quadrature_order
 
+    # get the quadrature cells and weights from the flexicubes data (active cells are ones containing the surface)
     qc, qw, active_cells = get_quadrature(
         quad_model,
         fc_data.cubes,
@@ -111,40 +117,40 @@ def sim_from_flexicubes(
         order=quad_order,
     )
 
-    grid_displacement_field = fem.make_polynomial_space(geo, degree=1, dtype=wp.vec3).make_field()
-    grid_displacement_field.dof_values = fc_data.pos
-    grid_displacement_field.dof_values.requires_grad = True
+    grid_displacement_field = fem.make_polynomial_space(geo, degree=1, dtype=wp.vec3).make_field() # creates a FEM field over geo, with blank space for each grid node
+    grid_displacement_field.dof_values = fc_data.pos # assigns the grid node positions to the DOFs
+    grid_displacement_field.dof_values.requires_grad = True # allows the DOFs to be optimized during training 
 
-    deformed_grid = grid_displacement_field.make_deformed_geometry(relative=False)
-    deformed_grid.build_bvh()
+    deformed_grid = grid_displacement_field.make_deformed_geometry(relative=False) # creates a new geometry object with grid node positions (essentially a copy of geo with the grid node positions)
+    deformed_grid.build_bvh() # builds a BVH for the deformed grid
 
     # Initialize sim
-    sim = sim_class(deformed_grid, active_cells, sim_args)
-    sim.init_displacement_space()
+    sim = sim_class(deformed_grid, active_cells, sim_args) # initializes simulator with the geometry object and active cells
+    sim.init_displacement_space() # initializes the displacement space (allocates memory for the displacement, velocity, force)
 
     if fc_data.stiffness is not None:
-        sim.scale_lame_field(wp.array(fc_data.stiffness, dtype=float))
+        sim.scale_lame_field(wp.array(fc_data.stiffness, dtype=float)) 
 
     # Replace regular quadrature will learned quadrature
-    domain = fem.Cells(sim.geo_partition)
-    if sim.cells is not None:
-        domain_qc = qc[sim.cells.array].contiguous()
+    domain = fem.Cells(sim.geo_partition) # integrate only on the active cells
+    if sim.cells is not None: # there must be some active cells
+        domain_qc = qc[sim.cells.array].contiguous() # get the quadrature cells and weights for the active cells
         domain_qw = qw[sim.cells.array].contiguous()
-        quadrature = fem.ExplicitQuadrature(domain, domain_qc, domain_qw)
+        quadrature = fem.ExplicitQuadrature(domain, domain_qc, domain_qw) # create a quadrature object for the active cells
     else:
-        quadrature = fem.ExplicitQuadrature(domain, qc, qw)
+        quadrature = fem.ExplicitQuadrature(domain, qc, qw) # create a quadrature object for all cells
 
-    sim.vel_quadrature = quadrature
+    sim.vel_quadrature = quadrature # sets the quadrature object for each 
     sim.strain_quadrature = quadrature
     sim.elasticity_quadrature = quadrature
 
     # For Mixed FEM: locate strain nodes at quadrature points
-    geo_quadrature = fem.ExplicitQuadrature(fem.Cells(deformed_grid), qc, qw)
+    geo_quadrature = fem.ExplicitQuadrature(fem.Cells(deformed_grid), qc, qw) # create another quadrature object 
     # basis evaluated only at quadrature points, PointBasisSpace is ok
-    rbf_basis = fem.PointBasisSpace(geo_quadrature)
-    sim.set_strain_basis(rbf_basis)
+    rbf_basis = fem.PointBasisSpace(geo_quadrature) # create a basis with nodes that are the quadrature points 
+    sim.set_strain_basis(rbf_basis) # sets the strain basis for the simulator 
 
-    sim.init_strain_spaces()
+    sim.init_strain_spaces() # initializes the strain spaces
 
     return sim
 
