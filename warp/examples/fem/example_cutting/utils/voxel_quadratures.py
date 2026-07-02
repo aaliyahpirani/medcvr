@@ -34,56 +34,82 @@ def instantiate_regular_quadrature(
     cell_qp_weights: wp.array2d(dtype=float),
     active_cells: wp.array(dtype=int),
 ):
-    """Fill per-cell quadrature points, clipping exterior ones if requested,
-    and mark inactive cells"""
+    """A warp kernel that fills in per-cell quadrature points, clipping the exterior ones if requested.
+    
+    Args:
+        clip: if True, clip the quadrature points that are outside of the cell
+        cell_indices: contains the 8 vertex indices for the current cell
+        vertex_sdf: contains the eight vertex SDF values for the current cell
+        cell_alphas: contains the 8 alphas for the current cell, used for interpolation of the SDF at the quadrature points
+        regular_coords: contains the quadrature points for the current cell in the cubes local coordinate system
+        regular_weights: contains the weights for the quadrature points
+        cell_qp_coords: contains the coordinates of the quadrature points for the current cell
+        cell_qp_weights: contains the weights of the quadrature points for the current cell
+        active_cells: contains the active cells for the current cell
+    Returns:
+        No returns, fills in cell_qp_coords, cell_qp_weights and active_cells
+    """
 
-    i = wp.tid()
-    vidx = cell_indices[i]
-    alphas = cell_alphas[i]
+    i = wp.tid() # create a thread index 
+    vidx = cell_indices[i] # get the vertex indices for the current cell 
+    alphas = cell_alphas[i] # get the alphas for the current cell
 
     # test if active
-    min_sdf = float(1.0e8)
+    min_sdf = float(1.0e8) # initialize the minimum SDF to a large value 
     for k in range(cell_indices.shape[1]):
-        min_sdf = wp.min(min_sdf, vertex_sdf[vidx[k]])
-    active_cells[i] = wp.where(min_sdf <= 0.0, 1, 0)
+        min_sdf = wp.min(min_sdf, vertex_sdf[vidx[k]]) # find the minimum SDF for the current cell
+    active_cells[i] = wp.where(min_sdf <= 0.0, 1, 0) # if the minimum is less than or equal to 0, set the active cell to 1, otherwise it is inactive
 
-    for j in range(regular_coords.shape[0]):
-        coords = regular_coords[j]
-        cell_qp_coords[i, j] = coords
-        cell_qp_weights[i, j] = regular_weights[j]
+    for j in range(regular_coords.shape[0]): # for each quadrature point
+        coords = regular_coords[j] # get the coordinates of the current quadrature point
+        cell_qp_coords[i, j] = coords # store the coordinates of the current quadrature point in cell_qp_coords
+        cell_qp_weights[i, j] = regular_weights[j] # store the weight of the current quadrature point in cell_qp_weights
 
         if clip:
             # Clip quadrature -- disable exterior qps
 
-            x = coords[0]
-            y = coords[1]
-            sdf = (
+            x = coords[0] # get the x coordindate
+            y = coords[1] # get the y coordinate
+            sdf = ( # interpolate the SDF at the current qudrature point 
                 (1.0 - x) * (1.0 - y) * vertex_sdf[vidx[0]] * alphas[0]
                 + (x) * (1.0 - y) * vertex_sdf[vidx[1]] * alphas[1]
                 + (1.0 - x) * (y) * vertex_sdf[vidx[2]] * alphas[2]
                 + (x) * (y) * vertex_sdf[vidx[3]] * alphas[3]
             )
 
-            if cell_indices.shape[1] > 4:
+            if cell_indices.shape[1] > 4: # if the cell has more than 4 vertices
                 z = coords[2]
-                sdf = (1.0 - z) * sdf + z * (
+                sdf = (1.0 - z) * sdf + z * ( # interpolate the SDF at the current quadrature point
                     (1.0 - x) * (1.0 - y) * vertex_sdf[vidx[4]] * alphas[4]
                     + (x) * (1.0 - y) * vertex_sdf[vidx[5]] * alphas[5]
                     + (1.0 - x) * (y) * vertex_sdf[vidx[6]] * alphas[6]
                     + (x) * (y) * vertex_sdf[vidx[7]] * alphas[7]
                 )
 
-            if sdf > 0.0:
+            if sdf > 0.0: # if the SDF is greater than 0, set the weight of the qudrature point to 0
                 cell_qp_weights[i, j] = 0.0
 
 
 def regular_quadrature(cell_vtx, sdf, cell_alpha, clip=True, order=2):
-    """Regular Gauss_Legendre quadrature points, possibly clipped"""
+    """
+    Takes in cell vertices, SDF values and alphas, and returns quadrature points, weights and active cells. 
+    
+    Args:
+        cell_vtx (np.ndarray): the vertices of each cell 
+        sdf (np.ndarray): the SDF values at each vertex
+        cell_alpha (np.ndarray): the alphas for each cell
+    
+    Returns:
+        qc (wp.array): the quadrature points
+        qw (wp.array): the quadrature weights
+        active_cells (wp.array): the active cells
+    """
 
-    cell_vtx = wp.array(cell_vtx, dtype=int)
+    cell_vtx = wp.array(cell_vtx, dtype=int) 
     sdf = wp.array(sdf, dtype=float)
     cell_alpha = wp.array(cell_alpha, dtype=float)
 
+    # if the cell has 8 vertices, use the cube quadrature points, otherwise use the square ones 
     if cell_vtx.shape[1] == 8:
         reg_points, reg_weights = fem.geometry.element.Cube().instantiate_quadrature(
             order=order, family=fem.Polynomial.GAUSS_LEGENDRE
@@ -91,13 +117,13 @@ def regular_quadrature(cell_vtx, sdf, cell_alpha, clip=True, order=2):
     else:
         reg_points, reg_weights = fem.geometry.element.Square().instantiate_quadrature(
             order=order, family=fem.Polynomial.GAUSS_LEGENDRE
-        )
+        ) # generates template quadrature points and weights 
 
     n_qp = len(reg_weights)
     reg_qp = wp.array(reg_points, dtype=wp.vec3)
     reg_qw = wp.array(reg_weights, dtype=float)
 
-    qc = wp.empty(shape=(cell_vtx.shape[0], n_qp), dtype=wp.vec3)
+    qc = wp.empty(shape=(cell_vtx.shape[0], n_qp), dtype=wp.vec3) # empty array to store quadrature points, weights, and active cells
     qw = wp.empty(shape=(cell_vtx.shape[0], n_qp), dtype=float)
     active_cells = wp.empty(shape=(cell_vtx.shape[0]), dtype=int)
 

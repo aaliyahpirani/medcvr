@@ -92,8 +92,15 @@ def sim_from_flexicubes(
     """Instantiates a simulator instance from serialized Flexicubes data
     
     Args:
+        sim_class (class): the simulator class (ClassicFEM by default)
+        fc_data (FcData): the Flexicubes data
+        geo: the geometry object 
+        sim_args: the simulation arguments 
+        quadrature_model: the path to the neural network model (None by default)
+        clip_qp: whether to clip
 
     Returns:
+        sim: a simulator instance
     """
 
     # Compute quadrature and active cells from flexicube sdf

@@ -198,12 +198,14 @@ def sculpt_sdf(
     grid_sdf: wp.array(dtype=float),
 ):
     """Update grid sdf values around a given position"""
-
+    # warp thread
     i = wp.tid()
+    # compute the distance between the grid node and the mouse position
     dist_sq = wp.length_sq(grid_node_pos[i] - update_pos[0])
 
+    # the change in sdf is e^(-falloff * dist_sq)
     delta_sdf = wp.exp(-falloff * dist_sq)
-    grid_sdf[i] += amount * delta_sdf
+    grid_sdf[i] += (amount * delta_sdf) / 50.0 # add to the sdf value 
 
 
 @wp.kernel
@@ -504,36 +506,38 @@ def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.a
                 world_pos = ps.screen_coords_to_world_position(screen_coords)
                 if np.all(np.isfinite(world_pos)):
                     prev_world_pos = world_pos
+
+                    rest_pos = clay.world_to_rest_pos(world_pos)
+
+                    amount = 50.0 * sign / res
+                    falloff = 0.25* res * res
+
+                    print(f"rest_pos={rest_pos.numpy()[0]}")
+                    wp.launch(
+                        sculpt_sdf,
+                        dim=grid_node_pos.shape[0],
+                        inputs=[amount, falloff, rest_pos, grid_node_pos, grid_sdf],
+                    )
+
+                    # rebuilds flexicubes structure and recreate sim
+                    flexicubes_data = flexicubes_from_sdf_grid(res, grid_sdf, grid_node_pos)
+                    sculpt_rebuild_count += 1
+                    if sculpt_rebuild_count == 1 or sculpt_rebuild_count % 10 == 0:
+                        debug_print(
+                            "Sculpt rebuild:",
+                            f"count={sculpt_rebuild_count}",
+                            f"amount={amount}",
+                            f"rest_pos={rest_pos.numpy()[0]}",
+                            f"surface_vertices={len(flexicubes_data.tri_vertices)}",
+                            f"surface_faces={len(flexicubes_data.tri_faces)}",
+                        )
+                    clay.create_sim(flexicubes_data, sim_class=sim_class)
+                    register_ps_meshes(flexicubes_data, clay.sim)
+
+                    io.WantCaptureMouse = True
+
                 elif prev_world_pos is not None:
                     world_pos = prev_world_pos
-
-                rest_pos = clay.world_to_rest_pos(world_pos)
-
-                amount = 50.0 * sign / res
-                falloff = 0.25 * res * res
-
-                wp.launch(
-                    sculpt_sdf,
-                    dim=grid_node_pos.shape[0],
-                    inputs=[amount, falloff, rest_pos, grid_node_pos, grid_sdf],
-                )
-
-                # rebuilds flexicubes structure and recreate sim
-                flexicubes_data = flexicubes_from_sdf_grid(res, grid_sdf, grid_node_pos)
-                sculpt_rebuild_count += 1
-                if sculpt_rebuild_count == 1 or sculpt_rebuild_count % 10 == 0:
-                    debug_print(
-                        "Sculpt rebuild:",
-                        f"count={sculpt_rebuild_count}",
-                        f"amount={amount}",
-                        f"rest_pos={rest_pos.numpy()[0]}",
-                        f"surface_vertices={len(flexicubes_data.tri_vertices)}",
-                        f"surface_faces={len(flexicubes_data.tri_faces)}",
-                    )
-                clay.create_sim(flexicubes_data, sim_class=sim_class)
-                register_ps_meshes(flexicubes_data, clay.sim)
-
-                io.WantCaptureMouse = True
 
         if io.KeyMods in (4, alt):
             print("Alt detected")
@@ -719,13 +723,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--y_max",
         type=float,
-        default=0.9,
+        default=0.99,
         help="Clamp points above this Y value",
     )
     parser.add_argument(
         "--cut_pick_radius",
         type=float,
-        default=0.1,
+        default=-0.99,
         help="Maximum world-space distance for Alt+left-click vertex-duplication cuts",
     )
     parser.add_argument(
