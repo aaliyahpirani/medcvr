@@ -334,129 +334,6 @@ class Clay:
         )
         return rest_pos
 
-    def duplicate_nearest_surface_vertex(self, flexicubes, world_pos, world_ray, max_dist):
-        tri_mesh = self.tri_mesh # the triangle mesh to query 
-        tri_mesh.refit() # update the triangle mesh to the current deformation (used to update vertex positions, not topology)
-
-        picked_face = wp.empty(1, dtype=int) # storage for the index of the closest triangle face
-        picked_vertex = wp.empty(1, dtype=int) # storage for the index of the closest vertex on the triangle 
-        picked_bary = wp.empty(1, dtype=wp.vec3) # storage for the barycentric coordinates of the closest point on the triangle 
-        
-        # launch the kernel to locate the closest triangle face and vertex
-        wp.launch(
-            closest_face_vertex_kernel,
-            dim=1,
-            inputs=[
-                tri_mesh.id,
-                wp.vec3(float(world_pos[0]), float(world_pos[1]), float(world_pos[2])),
-                max_dist,
-                picked_face,
-                picked_vertex,
-                picked_bary,
-            ],
-        )
-
-        face_id = int(picked_face.numpy()[0]) # convert to integer
-        vertex_id = int(picked_vertex.numpy()[0])
-
-        print(f"face_id={face_id}, vertex_id={vertex_id}")
-        if face_id < 0 or vertex_id < 0: # if no closest face or vertex was found, return False
-            debug_print("Cut pick missed:", f"world_pos={world_pos}", f"max_dist={max_dist}")
-            return False
-
-        faces = np.array(flexicubes.tri_faces, copy=True) # an array of triangle indices (so each set of 3 indices is a triangle)
-        vertices = np.array(flexicubes.tri_vertices, copy=True) # an array of vertex positions
-        deformed_vertices = tri_mesh.points.numpy() # an array of deformed vertex positions
-
-
-        # get the faces where the vertex we want to duplicate is a vertex 
-        # then return the indices of these faces
-        incident_faces = np.flatnonzero(np.any(faces == vertex_id, axis=1)) # returns indices of the faces that contain the vertex we want to duplicate 
-        if incident_faces.shape[0] < 2: # if we have less than 2 indicent faces return False (this would mean we are trying to duplicate a vertex that is not on the surface)
-            debug_print(
-                "Cut pick rejected:",
-                f"face_id={face_id}",
-                f"vertex_id={vertex_id}",
-                f"incident_faces={incident_faces.shape[0]}",
-            )
-            return False
-
-        face_vertices = faces[face_id] # get the vertices of the closest triangle face (x, y, z)
-        p0, p1, p2 = deformed_vertices[face_vertices] # these would be the positions of the vertices as they are deformed 
-        face_normal = np.cross(p1 - p0, p2 - p0) # cross product of two edges of the triangle to get the normal vector 
-        normal_norm = np.linalg.norm(face_normal) # magnitude of the normal vector
-        ray_norm = np.linalg.norm(world_ray) # magnitude of the ray direction
-        if normal_norm < 1.0e-8 or ray_norm < 1.0e-8: # if the normal vector/ray is too small, then we return false 
-            debug_print(
-                "Cut pick rejected due to degenerate direction:",
-                f"face_id={face_id}",
-                f"vertex_id={vertex_id}",
-                f"normal_norm={normal_norm}",
-                f"ray_norm={ray_norm}",
-            )
-            return False
-
-        face_normal /= normal_norm # normalize the normal vector 
-        ray_dir = world_ray / ray_norm # normalize the ray direction
-        cut_axis = np.cross(ray_dir, face_normal) # to get the axis we are slicing on 
-        axis_norm = np.linalg.norm(cut_axis) # magnitude of the cut axis (if small, this would mean that raydir and face normal are nearly parallel
-        if axis_norm < 1.0e-8: # if cut axis is too small... 
-            other_vertices = face_vertices[face_vertices != vertex_id] # get the other two vertices on the face
-            cut_axis = np.mean(deformed_vertices[other_vertices], axis=0) - deformed_vertices[vertex_id] # compute a vector of the vertex to the centroid of the other two vertices
-            axis_norm = np.linalg.norm(cut_axis) # magnitude of new cut axis
-            if axis_norm < 1.0e-8: # if too small
-                debug_print(
-                    "Cut pick rejected due to degenerate cut axis:",
-                    f"face_id={face_id}",
-                    f"vertex_id={vertex_id}",
-                )
-                return False
-        cut_axis /= axis_norm # normalize cut axis 
-
-        vertex_pos = deformed_vertices[vertex_id] # position of the vertex we want to duplicate 
-        duplicate_faces = []
-        original_faces = []
-        for incident_face in incident_faces: 
-            other_vertices = faces[incident_face][faces[incident_face] != vertex_id] # get the other two vertices on the given face
-            if other_vertices.shape[0] == 0:
-                continue
-
-            one_ring_centroid = np.mean(deformed_vertices[other_vertices], axis=0) # get the average position of the other two vertices on the face 
-            side = float(np.dot(one_ring_centroid - vertex_pos, cut_axis)) # get the signed distance from the vertex to the cut axis
-            if side >= 0.0: # if positive, it'll become a duplicate face
-                duplicate_faces.append(incident_face)
-            else: # if negative, it'll become an original face
-                original_faces.append(incident_face)
-
-        if not duplicate_faces or not original_faces:
-            print(f"duplicate_faces={duplicate_faces}", f"original_faces={original_faces}")
-            print("No duplicate or original faces found")
-            return False
-
-        new_vertex_id = vertices.shape[0] # one larger than the number of vertices in the mesh
-        vertices = np.vstack((vertices, vertices[vertex_id : vertex_id + 1])) # append the new vertex to the vertices array
-
-        duplicate_faces = np.array(duplicate_faces, dtype=int) # convert to numpy array
-        faces_to_update = faces[duplicate_faces] # get the (x, y, z) of the vertices to update to duplicate vertex
-        faces_to_update[faces_to_update == vertex_id] = new_vertex_id # change the new vertex to the duplicate vertex
-        faces[duplicate_faces] = faces_to_update # update the faces array to the new vertices 
-
-        flexicubes.tri_vertices = vertices # update the vertices
-        flexicubes.tri_faces = faces # update the faces
-        if flexicubes.vtx_displ is not None: # if there are displacement fields, append the new vertex to the displacement fields 
-            flexicubes.vtx_displ = np.vstack((flexicubes.vtx_displ, flexicubes.vtx_displ[vertex_id : vertex_id + 1]))
-
-        print(
-            "Duplicated surface vertex:",
-            f"old_vertex_id={vertex_id}",
-            f"new_vertex_id={new_vertex_id}",
-            f"picked_face={face_id}",
-            f"updated_faces={len(duplicate_faces)}",
-            f"total_vertices={vertices.shape[0]}",
-        )
-        return True
-
-
 def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.array, flexicubes):
     """Setups an interactive polyscope viewer and register hooks for sculpting and picking"""
 
@@ -707,7 +584,7 @@ if __name__ == "__main__":
         nargs="*",
         help="Path to the saved neural quadrature MLP weights. If not provided, use regular quadrature",
     )
-    parser.add_argument("--resolution", type=int, default=64, help="Grid resolution (at finest level)")
+    parser.add_argument("--resolution", type=int, default=128, help="Grid resolution (at finest level)")
     parser.add_argument(
         "--force_scale",
         type=float,
