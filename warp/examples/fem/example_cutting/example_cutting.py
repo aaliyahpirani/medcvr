@@ -584,7 +584,7 @@ if __name__ == "__main__":
         nargs="*",
         help="Path to the saved neural quadrature MLP weights. If not provided, use regular quadrature",
     )
-    parser.add_argument("--resolution", type=int, default=128, help="Grid resolution (at finest level)")
+    parser.add_argument("--resolution", type=int, default=64, help="Grid resolution (at finest level)")
     parser.add_argument(
         "--force_scale",
         type=float,

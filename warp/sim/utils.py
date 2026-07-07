@@ -335,6 +335,7 @@ def load_mesh(filename: str, method: str | None = None):
         if method == "meshio":
             import meshio
 
+            
             m = meshio.read(filename)
             mesh_points = np.array(m.points)
             mesh_indices = np.array(m.cells[0].data, dtype=np.int32)

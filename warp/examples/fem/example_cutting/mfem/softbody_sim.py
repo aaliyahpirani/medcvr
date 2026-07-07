@@ -455,21 +455,30 @@ class SoftbodySim:
         return lhs
 
     def run_frame(self):
+        """
+        Runs one frame of simulation.
+        """
+        # essentially saving the old frame and resetting du_field for next frame
         (self.du_field, self.du_prev) = (self.du_prev, self.du_field)
 
+        # in quasi-quasistatic mode, reset du_prev to zero - this removes the effect of the previous frame
         if self.args.quasi_quasistatic:
             self.du_prev.dof_values.zero_()
 
-        self.prepare_frame()
+        self.prepare_frame() # computes initial guess for next frame (including potentials)
 
-        tol = self.args.newton_tol**2
+        tol = self.args.newton_tol**2 # sets tolerance for newton's method
 
         def host_read(tup):
+            """
+            Helper function to read values from wp.array to numpy array on CPU
+            """
             return (x[:1].numpy()[0] if isinstance(x, wp.array) else x for x in tup)
 
-        E_cur, C_cur = host_read(self.evaluate_energy())
+        E_cur, C_cur = host_read(self.evaluate_energy()) # evaluates current total energy and constraint residual 
         cumulative_time = 0.0
 
+        # prints initial guess for energy and constraint residual if not quiet
         if not self.args.quiet:
             print(f"Newton initial guess: E={E_cur}, Cr={C_cur}")
         if self.log:
@@ -479,10 +488,12 @@ class SoftbodySim:
                 file=self.log,
             )
 
+        # runs for n_newton iterations
         for k in range(self.args.n_newton):
+            
             with wp.ScopedTimer(f"Iter {k}", print=False) as timer:
-                E_ref, C_ref = E_cur, C_cur
-                self.checkpoint_newton_values()
+                E_ref, C_ref = E_cur, C_cur # stores our current guesses as references
+                self.checkpoint_newton_values() # saves a snapshot of current state
 
                 self.prepare_newton_step()
                 rhs = self.newton_rhs()

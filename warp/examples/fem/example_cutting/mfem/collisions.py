@@ -83,6 +83,7 @@ class CollisionHandler:
         cp_cell_indices,
         cp_cell_coords,
     ):
+        # stores meshes
         self.warp_meshes = kinematic_meshes
         self.cp_cell_indices = cp_cell_indices
         self.cp_cell_coords = cp_cell_coords
@@ -254,15 +255,26 @@ class CollisionHandler:
         return dest
 
     def detect_collisions(self, dt):
+        """
+        Writes contact data that is later used to compute collision forces and hessian.
+        These contacts are refreshed when the mesh deforms.
+
+        Args:
+            dt: Time step
+
+        Returns: 
+
+        """
+        # buffer capacity
         max_contacts = self.collision_normals.shape[0]
 
-        count = wp.zeros(1, dtype=int)
-        indices_a = self.collision_indices_a
-        indices_b = self.collision_indices_b
-        normals = self.collision_normals
-        kinematic_gaps = self.collision_kinematic_gaps
+        count = wp.zeros(1, dtype=int) # current number of contacts
+        indices_a = self.collision_indices_a # collision quadrature point index on soft body
+        indices_b = self.collision_indices_b # for ground/kinematic meshes
+        normals = self.collision_normals # contact normal
+        kinematic_gaps = self.collision_kinematic_gaps # gap between soft body and ground/kinematic meshes
 
-        self.run_collision_detectors(
+        self.run_collision_detectors( # runs the actual collision detection kernels 
             dt,
             count,
             indices_a,
@@ -271,9 +283,9 @@ class CollisionHandler:
             kinematic_gaps,
         )
 
-        self.n_contact = int(count.numpy()[0])
+        self.n_contact = int(count.numpy()[0]) # update the number of contacts
 
-        if self.n_contact > max_contacts:
+        if self.n_contact > max_contacts: # if above buffer capacity, some contacts will be ignored 
             print("Warning: contact buffer size exceeded, some have bee ignored")
             self.n_contact = max_contacts
 
@@ -538,6 +550,9 @@ class CollisionPotential(DisplacementPotential):
         self.collision_handler.add_collision_forces(rhs)
 
     def prepare_newton_step(self, dt, tape=None):
+        """
+        Prepares the collision handler for the next Newton step
+        """
         self.collision_handler.prepare_newton_step(dt)
 
     def init_constant_forms(self):
