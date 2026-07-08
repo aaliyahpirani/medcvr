@@ -223,8 +223,19 @@ class CollisionHandler:
             )
 
     def cp_world_position(self, dest=None):
+        """
+        Interpolates the world position of each collision quadrature point. There is one collision quadrautre
+        point for each sample location where we compute collision forces.
+
+        Args: 
+            dest: optional destination array to store the world position of the collision quadrature points
+
+        Returns: 
+            The destination array containing the world position of the collision quadrature points
+        """
         cp_pic = self.collision_quadrature
 
+        # if no collision quadrature, return an empty array
         if cp_pic is None:
             if dest is None:
                 dest = wp.array([], dtype=wp.vec3)
@@ -232,26 +243,42 @@ class CollisionHandler:
                 dest.assign([])
             return dest
 
+        # if no destination array, create a new one
         if dest is None:
             dest = wp.empty(cp_pic.total_point_count(), dtype=wp.vec3)
+        # interpolate the world position of the collision quadrature points (domain + displacement)
         fem.interpolate(
             world_position,
             fields={"u": self.sim.u_field},
             dest=dest,
             quadrature=cp_pic,
         )
-
+        # return the destination array
         return dest
 
     def _sample_cp_displacement(self, du_field, dest=None):
+        """
+        Compute the displacement of each collision quadrature points. 
+
+        Args:
+            du_field: the displacement field to sample
+            dest: optional destination array 
+        
+        Returns:
+            None. Stores displacement of each collision quadrautre point in the destination array
+        """
+        # collision quadrautre points 
         cp_pic = self.collision_quadrature
+        # if no destination array, create a new one 
         if dest is None:
             dest = wp.empty(cp_pic.total_point_count(), dtype=wp.vec3)
+        # interpolate the displacement of the collision quadrature points and store in destination array
         fem.interpolate(
             du_field,
             dest=dest,
             quadrature=cp_pic,
         )
+
         return dest
 
     def detect_collisions(self, dt):
@@ -298,17 +325,40 @@ class CollisionHandler:
         normals,
         kinematic_gaps,
     ):
+        """
+        Runs the collision detection kernels. 
+
+        Args: 
+            dt: Time step
+            count: current number of contacts
+            indices_a: stores one index for each potential contact point. 
+            indices_b: stores one index for each potential contact point
+            normals: stores the contact normal for each contact point
+            kinematic_gaps: stores the gap between soft body and ground/kinematic meshes
+
+        Returns: 
+            None
+        """
+        # collision quadrature, stores the quadrature points
         cp_pic = self.collision_quadrature
+        # number of collision quadrature points
         n_cp = cp_pic.total_point_count()
+        # max num contacts
         max_contacts = self.collision_normals.shape[0]
 
+        # current position of collision quadrature points
         cp_cur_pos = self.cp_world_position()
+        # store the displacement of the collision quadrature points 
         cp_du = self._sample_cp_displacement(self.sim.du_field)
 
+        # calculate collision radius 
         collision_radius = self.args.collision_radius * self.args.collision_detection_ratio
 
+        # if we have a ground height, detect ground collisions
         if self.args.ground:
+            # ground height
             ground_height = self.args.ground_height
+            # launch the ground collision detection kernel
             wp.launch(
                 detect_ground_collisions,
                 dim=n_cp,
@@ -326,6 +376,9 @@ class CollisionHandler:
                     indices_b,
                 ],
             )
+
+        # if we have rigid meshes (kinematic meshes), detect collisions with them
+        # this is unused by example_cutting
         if self.warp_meshes:
             mesh_ids = wp.array([mesh.id for mesh in self.warp_meshes], dtype=wp.uint64)
             wp.launch(
@@ -449,9 +502,12 @@ class MeshSelfCollisionHandler(CollisionHandler):
         tri_mesh: wp.Mesh,
     ):
         super().__init__([], vtx_quadrature.cell_indices, vtx_quadrature.particle_coords)
-
+        
+        # store quadrature points for the vertices of the mesh 
         self.tri_vtx_quadrature = vtx_quadrature
+        # store rest positions of vertices
         self.vtx_rest_pos = wp.clone(tri_mesh.points)
+        # store the mesh
         self.tri_mesh = tri_mesh
 
     @staticmethod
@@ -474,8 +530,24 @@ class MeshSelfCollisionHandler(CollisionHandler):
         normals,
         kinematic_gaps,
     ):
+        """
+        Runs collision detection kernels and adds any additional self collision quadrature points.
+
+        Args:
+            dt: time step
+            count: the current number of contacts
+            indices_a: stores one index for each potential contact point. 
+            indices_b: stores one index for each potential contact point
+            normals: stores the contact normal for each contact point
+            kinematic_gaps: stores the gap between soft body and ground/kinematic meshes
+
+        Returns:
+            None
+        """
+        # set collision quadrature points  
         self.set_collision_quadrature(self.tri_vtx_quadrature)
 
+        # run collision detection kernels (these are for ground and kinematic mesh collisions)
         super().run_collision_detectors(
             dt,
             count,
@@ -484,19 +556,30 @@ class MeshSelfCollisionHandler(CollisionHandler):
             normals,
             kinematic_gaps,
         )
+        
+        # get world positions of quadrature points
         self.cp_world_position(dest=self.tri_mesh.points)
+        # refit the mesh so the changed positions are reflected in the mesh data structure 
         self.tri_mesh.refit()
 
+        # store the displacement of the quadrature points
         cp_du = self._sample_cp_displacement(self.sim.du_field)
 
+        # number of collision quadrature points
         n_cp = cp_du.shape[0]
+        # max contacts
         max_contacts = self.collision_normals.shape[0]
 
+        # collision radius 
         collision_radius = self.args.collision_radius * self.args.collision_detection_ratio
 
+        # initial number of contacts
         start_contacts = count.numpy()[0]
+
+        # store the world positions of the quadrature points
         pos_b = wp.empty(indices_b.shape, dtype=wp.vec3)
 
+        # launch self collision detection kernel
         wp.launch(
             detect_mesh_self_collisions,
             dim=(n_cp),
@@ -517,18 +600,24 @@ class MeshSelfCollisionHandler(CollisionHandler):
                 pos_b,
             ],
         )
+        # calculate the number of self contacts
         self_contacts = int(min(max_contacts, count.numpy()[0]) - start_contacts)
 
+        # if there are self contacts, create new quadrature points for them
         if self_contacts > 0:
+            # update quadrature points 
             contact_points = wp.empty(n_cp + self_contacts, dtype=wp.vec3)
+            # copy over the rest positions of the vertices and self contact positions
             wp.copy(contact_points[:n_cp], self.vtx_rest_pos)
             wp.copy(contact_points[n_cp:], pos_b[:self_contacts])
 
+            # create new quadrature points including self contacts
             quadrature = fem.PicQuadrature(
                 fem.Cells(self.sim.geo),
                 contact_points,
                 max_dist=self.sim.typical_length,
             )
+            # set 
             self.set_collision_quadrature(quadrature)
 
 
@@ -670,72 +759,92 @@ def detect_mesh_self_collisions(
     indices_b: wp.array(dtype=int),
     pos_b: wp.array(dtype=wp.vec3),
 ):
+    """
+    A warp kernel that detects self collisions between the vertices of a mesh. 
+
+    """
+    # thread index
     tid = wp.tid()
+    # get the mesh
     mesh = wp.mesh_get(mesh_id)
 
+    # store the world position of the vertex
     x = mesh.points[tid]
 
+    # store the lower and upper bounds of the query
     lower = x - wp.vec3(radius)
     upper = x + wp.vec3(radius)
 
+    # query result returns a box
     query = wp.mesh_query_aabb(mesh_id, lower, upper)
 
+    # iterate over the faces in the query result 
     face_index = wp.int32(0)
     while wp.mesh_query_aabb_next(query, face_index):
         t0 = mesh.indices[3 * face_index + 0]
         t1 = mesh.indices[3 * face_index + 1]
         t2 = mesh.indices[3 * face_index + 2]
         if tid == t0 or tid == t1 or tid == t2:
-            # Fast self collision
+            # ignore self collisions
             continue
 
+        # store the world positions of the vertices of the face
         u1 = mesh.points[t0]
         u2 = mesh.points[t1]
         u3 = mesh.points[t2]
 
+        # return the barycentric coordinates
         d, bary = project_on_tri_at_origin(x - u1, u2 - u1, u3 - u1)
+        # if the point is not in the interior, ignore it
         if wp.max(bary) >= 1.0 or wp.min(bary) <= 0.0:
-            # point not in interior, ignore
             continue
 
+        # store the interpolated position of the vertex and calculate the distance to the original point
         cp = bary[0] * u1 + bary[1] * u2 + bary[2] * u3
         delta = x - cp
 
+        # store the face normal
         face_nor = wp.mesh_eval_face_normal(mesh_id, face_index)
+        # store the sign of the distance to the face normal
         sign = wp.where(wp.dot(delta, face_nor) > 0.0, 1.0, -1.0)
 
+        # distance to original point
         dist = wp.length(delta) * sign
 
+        # if the distance is less than the collision radius, we have a collision
         if dist < radius:
             # discard self-collisions of points that were very close at rest
             rp0 = mesh_rest_pos[t0]
             rp1 = mesh_rest_pos[t1]
             rp2 = mesh_rest_pos[t2]
-            xb_rest = bary[0] * rp0 + bary[1] * rp1 + bary[2] * rp2
-            xa_rest = mesh_rest_pos[tid]
-            if wp.length(xb_rest - xa_rest) < self_immunity_ratio * radius:
+            xb_rest = bary[0] * rp0 + bary[1] * rp1 + bary[2] * rp2 # rest position of the colliding vertex
+            xa_rest = mesh_rest_pos[tid] # rest position of the original vertex
+            if wp.length(xb_rest - xa_rest) < self_immunity_ratio * radius: # if too close, ignore
                 continue
 
+            # add the contact
             idx = wp.atomic_add(count, 0, 1)
-            if idx >= max_contacts:
+            if idx >= max_contacts: # if we have too many contacts, ignore
                 return
 
             if dist < 0.00001:
                 n = face_nor
             else:
                 n = wp.normalize(delta) * sign
-            normals[idx] = n
+            normals[idx] = n # store the normal of the contact
 
-            du0 = du_cur[t0]
+            du0 = du_cur[t0] # current displacement
             du1 = du_cur[t1]
             du2 = du_cur[t2]
-            du = du_cur[tid] - du0 * bary[0] - du1 * bary[1] - du2 * bary[2]
+            # calculate the displacement of the original vertex relative to contact point
+            du = du_cur[tid] - du0 * bary[0] - du1 * bary[1] - du2 * bary[2] 
 
-            kinematic_gap = (dist - wp.dot(du, n)) * n
-            kinematic_gaps[idx] = kinematic_gap
-            indices_a[idx] = tid
-            indices_b[idx] = mesh.points.shape[0] + idx - cur_contacts
-            pos_b[idx - cur_contacts] = xb_rest
+            # calculate the gap between the original vertex and the contact point
+            kinematic_gap = (dist - wp.dot(du, n)) * n 
+            kinematic_gaps[idx] = kinematic_gap # store the gap
+            indices_a[idx] = tid # store index of original vertex
+            indices_b[idx] = mesh.points.shape[0] + idx - cur_contacts # store index of contact point
+            pos_b[idx - cur_contacts] = xb_rest # store the rest position of the colliding vertex
 
 
 @wp.func
