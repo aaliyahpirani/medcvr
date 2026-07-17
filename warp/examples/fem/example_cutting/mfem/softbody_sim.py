@@ -51,17 +51,38 @@ wp.set_module_options({"fast_math": True})
 
 @fem.integrand
 def defgrad(u: fem.Field, s: fem.Sample):
+    """
+    Computes the deformation gradient F = grad(u) + I, if no displacement then material is undeformed. 
+    """
     return fem.grad(u, s) + wp.identity(n=3, dtype=float)
 
 
 @fem.integrand
 def defgrad_avg(u: fem.Field, s: fem.Sample):
+    """
+    Computes the average deformation gradient. This applies for discontinuous fields, where the 
+    field needs to be averaged across elements.
+    """
     return fem.grad_average(u, s) + wp.identity(n=3, dtype=float)
 
 
 @fem.integrand
 def inertia_form(s: Sample, domain: Domain, u: Field, v: Field, rho: float, dt: float):
-    """<rho/dt^2 u, v>"""
+    """
+    Defines the intertia form for the displacement field. 
+    <rho/dt^2 u, v>
+    
+    Args:
+        s: sample 
+        domain: domain to integrate over
+        u: displacement at sample s
+        v: test function at sample s
+        rho: density
+        dt: timestep
+
+    Returns:
+        The inertia form for the displacement field.
+    """
 
     u_rhs = rho * u(s) / (dt * dt)
     return wp.dot(u_rhs, v(s))
@@ -69,9 +90,14 @@ def inertia_form(s: Sample, domain: Domain, u: Field, v: Field, rho: float, dt: 
 
 @fem.integrand
 def dg_penalty_form(s: Sample, domain: Domain, u: Field, v: Field, k: float):
+    """
+    Defines the penalty for neighbouring elements. k is the penalty stiffness.
+    """
+    # compute the difference in u between the two sides of an element boundary
     ju = fem.jump(u, s)
     jv = fem.jump(v, s)
 
+    # scale the penalty
     return wp.dot(ju, jv) * k * fem.measure_ratio(domain, s)
 
 
@@ -86,11 +112,14 @@ def displacement_rhs_form(
     gravity: wp.vec3,
     dt: float,
 ):
-    """<rho/dt^2 u, v> + <rho g, v>"""
+    """
+    Displacement right hand side form, it includes the intertia form and the gravity term. 
+    <rho/dt^2 u, v> + <rho g, v>
+    """
     f = (
-        inertia_form(s, domain, u_prev, v, rho, dt)
-        - inertia_form(s, domain, u, v, rho, dt)
-        + rho * wp.dot(gravity, v(s))
+        inertia_form(s, domain, u_prev, v, rho, dt) # intertia form for previous displacement
+        - inertia_form(s, domain, u, v, rho, dt) # current displacement
+        + rho * wp.dot(gravity, v(s)) # gravity term
     )
 
     return f
@@ -106,11 +135,28 @@ def kinetic_potential_energy(
     dt: float,
     gravity: wp.vec3,
 ):
-    du = u(s)
-    dv = v(s)
+    """
+    Computes the kinetic potential energy for the displacement field.
 
+    Args:
+        s: sample
+        domain: domain to integrate over
+        u: displacement at sample s
+        v: previous displacement at sample s
+        rho: density
+        dt: timestep
+        gravity: gravity
+
+    Returns:
+        The kinetic potential energy
+    """
+    du = u(s) # current displacement
+    dv = v(s) # previous displacement
+
+    # computing kinetic potential energy
     E = rho * (0.5 * wp.dot(du - dv, du - dv) / (dt * dt) - wp.dot(du, gravity))
 
+    # return the kinetic potential energy
     return E
 
 
@@ -120,6 +166,17 @@ def scale_lame(
     lame_ref: wp.vec2,
     scale: wp.array(dtype=float),
 ):
+    """
+    Scale the lame parameters by a factor of scale. 
+
+    Args:
+        lame_out: output lame parameters
+        lame_ref: reference lame parameters
+        scale: scale factor
+
+    Returns:
+        The scaled lame parameters
+    """
     i = wp.tid()
     lame_out[i] = lame_ref * scale[i]
 
@@ -217,6 +274,10 @@ class SoftbodySim:
         return False
 
     def _init_displacement_basis(self):
+        """
+        Initializes the basis which defines how values are interpolated across each element. 
+        It is scalar and gives the interpolation functions for each element. 
+        """
         element_basis = fem.ElementBasis.SERENDIPITY if self.args.serendipity else fem.ElementBasis.LAGRANGE
         self._vel_basis = fem.make_polynomial_basis_space(
             self.geo,
@@ -232,6 +293,10 @@ class SoftbodySim:
             self._vel_basis = basis
 
     def init_displacement_space(self, side_subdomain: Optional[fem.Domain] = None):
+        """
+        Initializes the displacement space which stores the displacement field values for each 
+        node in the geometry.
+        """
         args = self.args
 
         u_space = fem.make_collocated_function_space(self._vel_basis, dtype=wp.vec3)
@@ -288,21 +353,38 @@ class SoftbodySim:
         boundary_displacement_form=None,
         boundary_displacement_args=None,
     ):
+        """
+        creates a dirichlet boundary condition projector. 
+
+        Args:
+            boundary_projector_form: the form to project the boundary conditions
+            boundary_displacement_form: the form to project the boundary displacements
+            boundary_displacement_args: the arguments to project the boundary displacements
+
+        Returns:
+            None
+
+        """
+        # displacement space 
         u_space = self.u_field.space
 
         # Displacement boundary conditions
         boundary = fem.BoundarySides(self.geo_partition)
 
+        # test function for boundary conditions
         u_bd_test = fem.make_test(
             space=u_space,
             space_partition=self.u_test.space_partition,
             domain=boundary,
         )
+        # trial function for boundary conditions
         u_bd_trial = fem.make_trial(
             space=u_space,
             space_partition=self.u_test.space_partition,
             domain=boundary,
         )
+        # compute prescribed values if they are provided
+        # otherwise, create a zero matrix for the boundary conditions
         self.v_bd_rhs = None
         if boundary_displacement_form is not None:
             self.v_bd_rhs = fem.integrate(
@@ -312,6 +394,9 @@ class SoftbodySim:
                 assembly="nodal",
                 output_dtype=wp.vec3f,
             )
+        # this builds a projector that contains a 3x3 matrix for each node in the geometry
+        # for a fixed node, the matrix is the identity matrix 
+        # if no boundary projector is provided, a zero matrix is created
         if boundary_projector_form is not None:
             self.v_bd_matrix = fem.integrate(
                 boundary_projector_form,
@@ -320,11 +405,14 @@ class SoftbodySim:
                 output_dtype=float,
             )
         else:
+
             self.v_bd_matrix = sp.bsr_zeros(
                 self.u_trial.space_partition.node_count(),
                 self.u_trial.space_partition.node_count(),
                 block_type=wp.mat33,
             )
+        
+        # make it a true projector by normalizing it 
         fem.normalize_dirichlet_projector(self.v_bd_matrix, self.v_bd_rhs)
 
     def set_fixed_points_condition(
@@ -332,7 +420,18 @@ class SoftbodySim:
         fixed_points_projector_form,
         fixed_point_projector_args=None,
     ):
+        """
+        Picks which nodes are fixed and sets boundary conditions for them. 
+
+        Args: 
+            fixed_points_projector_form: the form to project the fixed points
+            fixed_point_projector_args: the arguments to project the fixed points 
+
+        Returns:
+            None. 
+        """
         self.v_bd_rhs = None
+        # integrate fixed points projector form to get the boundary conditions
         self.v_bd_matrix = fem.integrate(
             fixed_points_projector_form,
             fields={"u": self.u_trial, "v": self.u_test, "u_cur": self.u_field},
@@ -349,14 +448,19 @@ class SoftbodySim:
         fixed_points_displacement_field=None,
         fixed_points_displacement_args=None,
     ):
+        """
+        Sets a target value for the displacement field at fixed nodes.
+        """
+        # create a field to store the displacement 
         bd_field = self.u_test.space.make_field(space_partition=self.u_test.space_partition)
+        # interpolate the displacement field to the fixed points 
         fem.interpolate(
             fixed_points_displacement_field,
             dest=bd_field,
             fields={"u_cur": self.u_field},
             values=fixed_points_displacement_args or {},
         )
-
+        # store the displacement values at the fixed points 
         self.v_bd_rhs = bd_field.dof_values
 
     def set_collision_projector(self, collision_projector_form, collision_projector_args=None):
@@ -365,11 +469,17 @@ class SoftbodySim:
         self._collision_projector_args = collision_projector_args or {}
 
     def init_constant_forms(self):
+        """
+        Precomputes parts of the simulation that are
+        constant for one run, so they aren't rebuilt for each newton iteration. 
+        """
         args = self.args
 
-        if args.matrix_free:
+        if args.matrix_free: # if matrix free, don't compute inertia matrix
             self.A = None
         else:
+            # compute inertia matrix for each node
+            # if lumped mass, it is diagonal (cheaper to compute)
             if self.args.lumped_mass:
                 self.A = fem.integrate(
                     inertia_form,
@@ -386,7 +496,7 @@ class SoftbodySim:
                     output_dtype=float,
                     quadrature=self.vel_quadrature,
                 )
-
+            # if discontinuous penalty is used, add to inertia matrix 
             if self.side_quadrature is not None and self.args.dg_jump_pen > 0.0:
                 self.A += fem.integrate(
                     dg_penalty_form,
@@ -395,9 +505,10 @@ class SoftbodySim:
                     quadrature=self.side_quadrature,
                     output_dtype=float,
                 )
-
+            # finalize sparsity pattern
             self.A.nnz_sync()
 
+        # initialize each potential (they are still recomputed for each newton iteration)
         for potential in self.energy_potentials:
             potential.init_constant_forms()
 
@@ -405,12 +516,25 @@ class SoftbodySim:
         pass
 
     def constraint_free_rhs(self, dt=None, with_external_forces=True, tape=None):
+        """
+        Builds the base right hand side before applying boundary conditions. 
+
+        Args:
+            dt: timestep
+            with_external_forces: whether to include external forces
+            tape: tape to record gradients
+
+        Returns:
+            The base right hand side
+        """
+
         args = self.args
 
+        # gravity only if external forces are included
         gravity = self.gravity if with_external_forces else wp.vec3(0.0)
 
         # Quasi-quasistatic: normal dt in lhs (trust region), large dt in rhs (quasistatic)
-
+        # with_gradient: whether to record gradients
         with_gradient = tape is not None
         rhs_tape = wp.Tape() if tape is None else tape
         rhs = wp.zeros(
@@ -420,6 +544,7 @@ class SoftbodySim:
         )
 
         with rhs_tape:
+            # add inertia and gravity terms
             fem.integrate(
                 displacement_rhs_form,
                 fields={"u": self.du_field, "u_prev": self.du_prev, "v": self.u_test},
@@ -428,8 +553,9 @@ class SoftbodySim:
                 quadrature=self.vel_quadrature,
                 kernel_options={"enable_backward": True},
             )
-
+            # for discontinuous elements, add penalty terms for forces to resist unwanted displacement jumps 
             if self.side_quadrature is not None and self.args.dg_jump_pen > 0.0:
+                # add discontinuous penalty terms
                 fem.integrate(
                     dg_penalty_form,
                     fields={"u": self.u_field.trace(), "v": self.u_side_test},
@@ -440,15 +566,20 @@ class SoftbodySim:
                     kernel_options={"enable_backward": True},
                 )
 
-        if with_external_forces:
+        if with_external_forces: # if external forces are included, add potential forces
             for potential in self.energy_potentials:
                 potential.add_forces(rhs, rhs_tape)
 
         return rhs
 
     def constraint_free_lhs(self):
+        """
+        builds base newton matrix before fixed point constraints/elasticity are applied
+        """
+        # copy inertia matrix
         lhs = sp.bsr_copy(self.A)
 
+        # add each potentials hessian to the base newton matrix 
         for potential in self.energy_potentials:
             potential.add_hessian(lhs)
 
@@ -500,22 +631,22 @@ class SoftbodySim:
                 lhs = self.newton_lhs()
                 delta_fields = self.solve_newton_system(lhs, rhs)
 
-                self.apply_newton_deltas(delta_fields)
+                self.apply_newton_deltas(delta_fields) # applies the displacement deltas 
                 E_cur, C_cur = host_read(self.evaluate_energy())
 
-                ddu = delta_fields[0]
-                step_size = wp.utils.array_inner(ddu, ddu) / (1 + ddu.shape[0])
+                ddu = delta_fields[0] # displacement delta storage
+                step_size = wp.utils.array_inner(ddu, ddu) / (1 + ddu.shape[0]) # calculates the average magnitude of the correction   
 
                 # linear model
-                self._ls.build_linear_model(lhs, rhs, delta_fields)
+                self._ls.build_linear_model(lhs, rhs, delta_fields) # builds model of energy change 
 
                 # Line search
                 alpha = 1.0
                 for _j in range(self.args.n_backtrack):
-                    if self._ls.accept(alpha, E_cur, C_cur, E_ref, C_ref):
+                    if self._ls.accept(alpha, E_cur, C_cur, E_ref, C_ref): # if we accept the step
                         break
 
-                    alpha = 0.5 * alpha
+                    alpha = 0.5 * alpha # try again with a smaller step 
                     self.apply_newton_deltas(delta_fields, alpha=alpha)
                     E_cur, C_cur = host_read(self.evaluate_energy())
 
@@ -545,6 +676,7 @@ class SoftbodySim:
                 break
 
     def prepare_newton_step(self, tape=None):
+        # calls prepare_newton_step for each potential
         for potential in self.energy_potentials:
             potential.prepare_newton_step(self.dt, tape)
 
@@ -576,10 +708,12 @@ class SoftbodySim:
         return 1.0e6 if self.args.quasi_quasistatic else self.dt
 
     def evaluate_energy(self, E_u=None, cr=None):
+        """ Evaluates the energy of the system.
+        """
         if E_u is None:
-            E_u = wp.zeros(shape=(1,), dtype=float)
+            E_u = wp.zeros(shape=(1,), dtype=float) # create a storage array
 
-        E_u = fem.integrate(
+        E_u = fem.integrate( # integrate the kinetic and potential energy terms over the domain
             kinetic_potential_energy,
             quadrature=self.vel_quadrature,
             fields={"u": self.du_field, "v": self.du_prev},
@@ -591,8 +725,8 @@ class SoftbodySim:
             output=E_u,
             add=True,
         )
-
-        if self.side_quadrature is not None and self.args.dg_jump_pen > 0.0:
+        # if we have discontinuities, add penalty forces
+        if self.side_quadrature is not None and self.args.dg_jump_pen > 0.0: # if there are discontinuities, add penalty terms for forces to resist unwanted displacement jumps 
             fem.integrate(
                 dg_penalty_form,
                 fields={"u": self.u_field.trace(), "v": self.u_field.trace()},
@@ -602,16 +736,20 @@ class SoftbodySim:
                 add=True,
             )
 
-        for potential in self.energy_potentials:
+        for potential in self.energy_potentials: # add energy from each potential
             potential.add_energy(E_u)
 
-        return E_u, cr
+        return E_u, cr # return the total energy and constraint residual 
 
     def _filter_forces(self, u_rhs, tape, temporary_store=None):
+        """
+        Filters forces through the collision projector by removing components in constrained directions.
+        """
+
         if self._collision_projector_form is not None:
             # update collision projector, if required
             self.force_field.dof_values = u_rhs
-
+            # produces a diagonal matrix of projection coeff
             self.v_bd_matrix = fem.integrate(
                 self._collision_projector_form,
                 fields={
@@ -624,13 +762,17 @@ class SoftbodySim:
                 assembly="nodal",
                 output_dtype=float,
             )
+
             fem.normalize_dirichlet_projector(self.v_bd_matrix)
             self.project_constant_forms()
 
+        # temp storage 
         orig_rhs = fem.borrow_temporary_like(u_rhs, temporary_store)
         orig_rhs.array.assign(u_rhs)
 
+        # tape for adjoint computation 
         proj_tape = wp.Tape() if tape is None else tape
+        # perform projection
         with proj_tape:
             diff_bsr_mv(
                 A=self.v_bd_matrix,
@@ -742,6 +884,10 @@ class ClassicFEM(SoftbodySim):
         return not self.has_discontinuities()
 
     def init_strain_spaces(self):
+        """
+        Initializes space for strain calculations. 
+        """
+
         self.elasticity_quadrature = self.vel_quadrature
         self.constraint_field = self.interpolated_constraint_field
         self._constraint_field_restriction = fem.make_restriction(
@@ -752,8 +898,13 @@ class ClassicFEM(SoftbodySim):
         pass
 
     def prepare_newton_step(self, tape: wp.Tape = None):
+        """
+        newton iteration preparation
+        """
+        # updates every registered potential
         super().prepare_newton_step(tape=tape)
 
+        # cache polar decomp for non-neohookean materials
         if not self.args.neo_hookean:
             if tape is not None:
                 with tape:
@@ -762,8 +913,9 @@ class ClassicFEM(SoftbodySim):
                 self._cache_polar_decomposition()
 
     def evaluate_energy(self, E_u=None):
-        E_u, c_r = super().evaluate_energy(E_u=E_u)
+        E_u, c_r = super().evaluate_energy(E_u=E_u) # evaluate kinetic and potential energy
 
+        # evaluate elastic energy
         fem.integrate(
             self.elastic_energy,
             quadrature=self.elasticity_quadrature,
@@ -772,6 +924,7 @@ class ClassicFEM(SoftbodySim):
             add=True,
         )
 
+        # evaluate elastic energy on side quadrature points if discontinuities are present
         if self.side_quadrature is not None:
             fem.integrate(
                 self.elastic_energy_dg_sip,
@@ -784,12 +937,18 @@ class ClassicFEM(SoftbodySim):
                 output=E_u,
             )
 
+        # return energy and constraint residual
         return E_u, c_r
 
     def newton_lhs(self):
+        """
+        Constructs the matrix on the LHS of the newton system. 
+        """
         if self.args.matrix_free:
             return None
 
+        # integrate elasticity hessian to get matrix
+        # output is a sparse BSR stiffness matrix
         u_matrix = fem.integrate(
             self.elasticity_hessian,
             quadrature=self.elasticity_quadrature,
@@ -802,7 +961,7 @@ class ClassicFEM(SoftbodySim):
             values=self._elasticity_form_arguments(),
             output_dtype=float,
         )
-
+        # if we have discontinuities, add elasticity hessian 
         if self.side_quadrature is not None:
             fem.integrate(
                 self.elasticity_hessian_dg_sip,
@@ -818,16 +977,22 @@ class ClassicFEM(SoftbodySim):
                 output=u_matrix,
             )
 
+        # constraint_free_lhs is the matrix of the constraint free system
         u_matrix += self.constraint_free_lhs()
-        fem.dirichlet.project_system_matrix(u_matrix, self.v_bd_matrix)
+        fem.dirichlet.project_system_matrix(u_matrix, self.v_bd_matrix) # projcet to enforce boundary conditions
 
         return u_matrix
 
     def newton_rhs(self, tape: wp.Tape = None):
+        """
+        Builds the force vector on the RHS for classic FEM newton solve
+        """
+        # force vector for the constraint free system 
         u_rhs = self.constraint_free_rhs(tape=tape)
 
+        # tape for adjoint computation 
         rhs_tape = wp.Tape() if tape is None else tape
-        with rhs_tape:
+        with rhs_tape: # evaluate elastic forces 
             fem.integrate(
                 self.elastic_forces,
                 quadrature=self.elasticity_quadrature,
@@ -842,7 +1007,7 @@ class ClassicFEM(SoftbodySim):
                 kernel_options={"enable_backward": True},
             )
 
-            if self.side_quadrature is not None:
+            if self.side_quadrature is not None: # if we have discontinuities, add elastic forces on side quadrature points
                 fem.integrate(
                     self.elastic_forces_dg_sip,
                     quadrature=self.side_quadrature,
@@ -855,14 +1020,22 @@ class ClassicFEM(SoftbodySim):
                     add=True,
                     output=u_rhs,
                 )
-
-        self._minus_dE_du = wp.clone(u_rhs, requires_grad=False)
-
-        self._filter_forces(u_rhs, tape=tape)
+        # save a copy of u_rhs before boundary conditions are applied 
+        self._minus_dE_du = wp.clone(u_rhs, requires_grad=False) 
+        # remove forces in constrained directions 
+        self._filter_forces(u_rhs, tape=tape) 
 
         return u_rhs
 
     def _cache_polar_decomposition(self, requires_grad: bool = False):
+        """
+        Precomputes the SVD of the deformation gradient (F = U * diag(sig) * V^T) at every
+        elasticity quadrature point, storing the results in self._svd_U/_svd_sig/_svd_V.
+
+        Args:
+            requires_grad: whether to allocate the cached arrays with gradients enabled
+                (needed when recording the computation for autodiff)
+        """
         # precompute polar decomposition
         qp_count = self.elasticity_quadrature.total_point_count()
         self._svd_U = wp.empty(dtype=wp.mat33, shape=qp_count, requires_grad=requires_grad)
@@ -896,6 +1069,9 @@ class ClassicFEM(SoftbodySim):
 
     @staticmethod
     def _solve_fp64(lhs, rhs, res, maxiters, tol=None):
+        """
+        Solves the linear system using 64 bit precision. 
+        """
         lhs64 = sp.bsr_copy(lhs, scalar_type=wp.float64)
         rhs64 = wp.empty(shape=rhs.shape, dtype=wp.vec3d, device=rhs.device)
         wp.utils.array_cast(in_array=rhs, out_array=rhs64)
@@ -915,6 +1091,9 @@ class ClassicFEM(SoftbodySim):
         return res
 
     def solve_newton_system(self, lhs, rhs):
+        """
+        solves the linear system assembled by newton_lhs and newton_Rhs
+        """
         if self.args.fp64:
             res = wp.empty_like(rhs)
             ClassicFEM._solve_fp64(lhs, rhs, res, maxiters=self.args.cg_iters, tol=self.args.cg_tol)
@@ -939,19 +1118,23 @@ class ClassicFEM(SoftbodySim):
         return (res,)
 
     def record_adjoint(self, tape):
+        """perform and record the adjoint computation using stress interpolation for loss
+        """
         # The forward Newton is finding a root of rhs(q, p) = 0 with q = (u, S, R, lambda)
         # so drhs/dp = drhs/dq dq/dp + drhs/dp = 0
         # [- drhs/dq] dq/dp = drhs/dp
         # lhs dq/dp = drhs/dp
-
+        # rebuild the system
         self.prepare_newton_step(tape=tape)
         rhs = self.newton_rhs(tape=tape)
         lhs = self.newton_lhs()
 
+        # solve the system
         def solve_backward():
             adj_res = self.u_field.dof_values.grad
             ClassicFEM._solve_fp64(lhs, adj_res, rhs.grad, maxiters=self.args.cg_iters)
 
+        # record the stress interpolation 
         tape.record_func(
             solve_backward,
             arrays=[
@@ -965,6 +1148,9 @@ class ClassicFEM(SoftbodySim):
             self.interpolate_constraint_field()
 
     def interpolate_constraint_field(self, strain=False):
+        """
+        Interpolates the constraint field 
+        """
         field = self.strain_field if strain else self.stress_field
 
         fem.interpolate(
@@ -1291,6 +1477,18 @@ def run_softbody_sim(
     log=None,
     shutdown=False,
 ):
+    """
+    Runs the softbody simulation.
+
+    Args:
+        sim: simulation object
+        init_callback: callback function to initialize the simulation
+        frame_callback: callback function to update the frame
+        ui: whether to use the UI
+        log:
+        shutdown: close after n_frames
+    """
+    # log file for recording simulation data
     if log is not None:
         with open(log, "w") as log_f:
             sim.log = log_f
@@ -1298,25 +1496,27 @@ def run_softbody_sim(
             sim.log = None
         return
 
-    if not ui:
-        sim.init_constant_forms()
-        sim.project_constant_forms()
+    if not ui: # if in headless mode, run the simulation without the UI
+        sim.init_constant_forms() 
+        sim.project_constant_forms() # using boundary cond 
 
         sim.cur_frame = 0
-        if init_callback:
+        if init_callback: # initialize the simulation 
             init_callback()
 
+        # get indices of active nodes 
         active_indices = sim.u_field.space_partition.space_node_indices().numpy()
+
 
         for frame in range(sim.args.n_frames):
             sim.cur_frame = frame + 1
             with wp.ScopedTimer(f"--- Frame --- {sim.cur_frame}", synchronize=True):
                 sim.run_frame()
 
-            displaced_pos = sim.u_field.space.node_positions().numpy()
-            displaced_pos[active_indices] += sim.u_field.dof_values.numpy()
+            displaced_pos = sim.u_field.space.node_positions().numpy() # get reference node positions
+            displaced_pos[active_indices] += sim.u_field.dof_values.numpy() # add the displacement to the reference positions
 
-            if frame_callback:
+            if frame_callback: # call frame callback with the displaced positions 
                 frame_callback(displaced_pos)
         return
 
@@ -1325,11 +1525,11 @@ def run_softbody_sim(
     active_cells = None if sim.cells is None else sim.cells.array.numpy()
 
     try:
-        hexes = sim.u_field.space.node_hexes()
+        hexes = sim.u_field.space.node_hexes() # retrieve visualization hexes
 
-        if active_cells is not None:
-            hex_per_cell = len(hexes) // sim.geo.cell_count()
-            selected_hexes = np.broadcast_to(
+        if active_cells is not None: # if there are active cells
+            hex_per_cell = len(hexes) // sim.geo.cell_count() # number of hexes per cell
+            selected_hexes = np.broadcast_to( # broadcast the active cells to the hexes
                 (active_cells * hex_per_cell).reshape(len(active_cells), 1),
                 shape=(len(active_cells), hex_per_cell),
             )
@@ -1345,10 +1545,10 @@ def run_softbody_sim(
 
     if hexes is None:
         try:
-            tets = sim.u_field.space.node_tets()
+            tets = sim.u_field.space.node_tets() # if no hexes, use tets for visualization
 
             if active_cells is not None:
-                tet_per_cell = len(tets) // sim.geo.cell_count()
+                tet_per_cell = len(tets) // sim.geo.cell_count() # number of tets per cell
                 selected_tets = np.broadcast_to(
                     (active_cells * tet_per_cell).reshape(len(active_cells), 1),
                     shape=(len(active_cells), tet_per_cell),
@@ -1358,7 +1558,7 @@ def run_softbody_sim(
                     shape=(len(active_cells), tet_per_cell),
                 )
 
-                tets = tets[selected_tets.flatten()]
+                tets = tets[selected_tets.flatten()] 
 
         except AttributeError:
             tets = None
@@ -1368,10 +1568,11 @@ def run_softbody_sim(
     ps.init()
     ps.set_ground_plane_mode(mode_str="none")
 
-    node_pos = sim.u_field.space.node_positions().numpy()
+    node_pos = sim.u_field.space.node_positions().numpy() # get node positions 
+    # register a mesh at the current node position 
+    ps_vol = ps.register_volume_mesh("volume mesh", node_pos, hexes=hexes, tets=tets, edge_width=1.0) 
 
-    ps_vol = ps.register_volume_mesh("volume mesh", node_pos, hexes=hexes, tets=tets, edge_width=1.0)
-
+    # initialize the simulation 
     sim.init_constant_forms()
     sim.project_constant_forms()
     sim.cur_frame = 0
@@ -1379,6 +1580,7 @@ def run_softbody_sim(
     if init_callback:
         init_callback()
 
+    # indices of active nodes 
     active_indices = sim.u_field.space_partition.space_node_indices().numpy()
 
     def callback():
@@ -1390,9 +1592,11 @@ def run_softbody_sim(
 
         with wp.ScopedTimer(f"--- Frame --- {sim.cur_frame}", synchronize=True):
             sim.run_frame()
-
+        # displaced node positions
         displaced_pos = sim.u_field.space.node_positions().numpy()
+        # update displaced positions of active nodes 
         displaced_pos[active_indices] += sim.u_field.dof_values.numpy()
+        # update mesh positions
         ps_vol.update_vertex_positions(displaced_pos)
 
         if frame_callback:

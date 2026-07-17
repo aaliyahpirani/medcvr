@@ -465,24 +465,25 @@ class SoftbodySim:
                 self.prepare_newton_step()
                 rhs = self.newton_rhs()
                 lhs = self.newton_lhs()
-                delta_fields = self.solve_newton_system(lhs, rhs)
+                delta_fields = self.solve_newton_system(lhs, rhs) # delta_fields[0] is the displacement delta
+                # depending on the type of FEM, there may be multiple delta fields
 
-                self.apply_newton_deltas(delta_fields)
-                E_cur, C_cur = self.evaluate_energy()
+                self.apply_newton_deltas(delta_fields) # apply the displacement delta to the field 
+                E_cur, C_cur = self.evaluate_energy() # evaluate the energy after the newton step
 
-                ddu = delta_fields[0]
-                step_size = wp.utils.array_inner(ddu, ddu) / (1 + ddu.shape[0])
+                ddu = delta_fields[0] # displacement delta
+                step_size = wp.utils.array_inner(ddu, ddu) / (1 + ddu.shape[0]) # avg magnitude of correction
 
                 # linear model
-                self._ls.build_linear_model(self, lhs, rhs, delta_fields)
+                self._ls.build_linear_model(self, lhs, rhs, delta_fields) # estimate the energy change as alpha changes
 
                 # Line search
                 alpha = 1.0
                 for _j in range(self.args.n_backtrack):
-                    if self._ls.accept(alpha, E_cur, C_cur, E_ref, C_ref):
+                    if self._ls.accept(alpha, E_cur, C_cur, E_ref, C_ref): # if it reduces energy sufficiently
                         break
 
-                    alpha = 0.5 * alpha
+                    alpha = 0.5 * alpha # try with smaller step
                     self.apply_newton_deltas(delta_fields, alpha=alpha)
                     E_cur, C_cur = self.evaluate_energy()
 
@@ -508,13 +509,15 @@ class SoftbodySim:
                     file=self.log,
                 )
 
-            if step_size < tol:
+            if step_size < tol: # if the step size is small enough, we are done
                 break
 
     def prepare_newton_step(self, tape=None):
         pass
 
     def checkpoint_newton_values(self):
+        """ Store the current displacement and displacement delta 
+        """
         self._u_cur = wp.clone(self.u_field.dof_values)
         self._du_cur = wp.clone(self.du_field.dof_values)
 
@@ -553,6 +556,9 @@ class SoftbodySim:
         return E_u, 0.0
 
     def _filter_forces(self, u_rhs):
+        """
+        Remove force components at fixed/constrained DOFs. 
+        """
         sp.bsr_mv(
             A=self.v_bd_matrix,
             x=u_rhs,
