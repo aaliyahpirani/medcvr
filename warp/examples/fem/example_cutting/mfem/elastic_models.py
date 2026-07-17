@@ -36,18 +36,34 @@ _SQRT_1_2 = wp.constant(math.sqrt(1.0 / 2.0))
 
 @wp.func
 def hooke_stress(S: wp.mat33, lame: wp.vec2):
+    """
+    Computes linear elastic stress.
+
+    Args:
+        S: the strain tensor
+        lame: the lame constants
+
+    Returns:
+        The linear elastic stress as a 3x3 matrix.
+    """
     strain = S - wp.identity(n=3, dtype=float)
     return 2.0 * lame[1] * strain + lame[0] * wp.trace(strain) * wp.identity(n=3, dtype=float)
 
 
 @wp.func
 def hooke_energy(S: wp.mat33, lame: wp.vec2):
+    """
+    Computes Hookean strain-energy density. Energy is 0 in undeformed state and increases quadratically with strain.
+    """
     strain = S - wp.identity(n=3, dtype=float)
     return 0.5 * wp.ddot(strain, hooke_stress(S, lame))
 
 
 @wp.func
 def hooke_hessian(S: wp.mat33, tau: wp.mat33, sig: wp.mat33, lame: wp.vec2):
+    """
+    Computes the hookean energy hessian contracted with directions tau and sig. 
+    """
     return wp.ddot(hooke_stress(sig + wp.identity(n=3, dtype=float), lame), tau)
 
 
@@ -66,6 +82,9 @@ def nh_parameters_from_lame(lame: wp.vec2):
 
 @wp.func
 def nh_energy(F: wp.mat33, lame: wp.vec2):
+    """
+    Computes neo-hookean energy. 
+    """
     J = wp.determinant(F)
     mu_nh, lambda_nh = nh_parameters_from_lame(lame)
     gamma = 1.0 + mu_nh / lambda_nh
@@ -77,7 +96,10 @@ def nh_energy(F: wp.mat33, lame: wp.vec2):
 
 @wp.func
 def nh_stress(F: wp.mat33, lame: wp.vec2):
-    J = wp.determinant(F)
+    """
+    Computes the deriative of nh_energy with respect to F. 
+    """
+    J = wp.determinant(F) 
     mu_nh, lambda_nh = nh_parameters_from_lame(lame)
     gamma = 1.0 + mu_nh / lambda_nh
 
@@ -86,6 +108,9 @@ def nh_stress(F: wp.mat33, lame: wp.vec2):
 
 @wp.func
 def nh_hessian_proj(F: wp.mat33, tau: wp.mat33, sig: wp.mat33, lame: wp.vec2):
+    """
+    Computes a staibilized hessian bilinear form. 
+    """
     dJ_dF_s = _dJ_dF(F)
 
     mu_nh, lambda_nh = nh_parameters_from_lame(lame)
@@ -105,6 +130,9 @@ def nh_hessian_proj(F: wp.mat33, tau: wp.mat33, sig: wp.mat33, lame: wp.vec2):
 
 @wp.func
 def nh_hessian_proj_analytic(F: wp.mat33, tau: wp.mat33, sig: wp.mat33, lame: wp.vec2):
+    """
+    Computes a positive-semidefinite hessian using eigendecomp. 
+    """
     mu_nh, lambda_nh = snh_parameters_from_lame(lame)
 
     J = wp.determinant(F)
@@ -132,6 +160,9 @@ def snh_parameters_from_lame(lame: wp.vec2):
 
 @wp.func
 def snh_energy(F: wp.mat33, lame: wp.vec2):
+    """
+    Computes stable neo-hookean energy. 
+    """
     mu_nh, lambda_nh = snh_parameters_from_lame(lame)
     gamma = 1.0 + 0.75 * mu_nh / lambda_nh
 
@@ -145,6 +176,9 @@ def snh_energy(F: wp.mat33, lame: wp.vec2):
 
 @wp.func
 def snh_stress(F: wp.mat33, lame: wp.vec2):
+    """
+    differentiates snh_energy with respect to F. 
+    """
     J = wp.determinant(F)
     mu_nh, lambda_nh = snh_parameters_from_lame(lame)
     gamma = 1.0 + 0.75 * mu_nh / lambda_nh
@@ -156,6 +190,9 @@ def snh_stress(F: wp.mat33, lame: wp.vec2):
 
 @wp.func
 def snh_hessian_proj(F: wp.mat33, tau: wp.mat33, sig: wp.mat33, lame: wp.vec2):
+    """
+    computes the stabilized hessian bilinear form. 
+    """
     dJ_dF_s = _dJ_dF(F)
 
     mu_nh, lambda_nh = snh_parameters_from_lame(lame)
@@ -183,6 +220,9 @@ def snh_hessian_proj(F: wp.mat33, tau: wp.mat33, sig: wp.mat33, lame: wp.vec2):
 
 @wp.func
 def snh_hessian_proj_analytic(F: wp.mat33, tau: wp.mat33, sig: wp.mat33, lame: wp.vec2):
+    """
+    Performs positive-semidefinite projection using the SVD. Returns a scalar. 
+    """
     mu_nh, lambda_nh = snh_parameters_from_lame(lame)
 
     Ic = wp.ddot(F, F)
@@ -209,6 +249,9 @@ def hessian_proj_analytic(
     sig: wp.mat33,
     tau: wp.mat33,
 ):
+    """
+    performs explicit spectral projection and removes all negative eigenvalues. 
+    """
     U = wp.mat33()
     S = wp.vec3()
     V = wp.mat33()
@@ -250,6 +293,9 @@ def hessian_proj_analytic(
 
 @wp.func
 def _flip_rot_eivec(k: int, sign: float, mat: wp.mat33):
+    """
+    constructs one normalized flip/rotation eigenmatrix of the hessian. 
+    """
     E = wp.mat33(0.0)
     k2 = (k + 2) % 3
     k1 = (k + 1) % 3
@@ -260,12 +306,18 @@ def _flip_rot_eivec(k: int, sign: float, mat: wp.mat33):
 
 @wp.func
 def _dJ_dF(F: wp.mat33):
+    """
+    derivative of the determinant of F
+    """
     Ft = wp.transpose(F)
     return wp.mat33(wp.cross(Ft[1], Ft[2]), wp.cross(Ft[2], Ft[0]), wp.cross(Ft[0], Ft[1]))
 
 
 @wp.func
 def _d2J_dF2(F: wp.mat33, sig: wp.mat33, tau: wp.mat33):
+    """
+    second deriative of the determinant of F
+    """
     Ft = wp.transpose(F)
     sigt = wp.transpose(sig)
     return wp.ddot(
@@ -280,12 +332,13 @@ def _d2J_dF2(F: wp.mat33, sig: wp.mat33, tau: wp.mat33):
 
 @wp.func
 def _d2J_dF2_scale(J: float, Ic: float, J_scale: float, Id_scale: float):
-    # compute a scaling for d2J such that Id_scale * Id + J_scale * d2J
-    # has no negative eigenvalues
+    """
+    Clamps the coefficient of the determinant Hessian so that
+    Id_scale * Id + J_scale * d2J has no negative eigenvalues.
 
-    # Min/max eigenvalues for d2J are estimated according to
-    # sec 4.5 of "Stable Neo-Hookean Flesh Simulation" (Smith et al. 2018)
-
+    Min/max eigenvalues for d2J are estimated according to
+    sec 4.5 of "Stable Neo-Hookean Flesh Simulation" (Smith et al. 2018).
+    """
     d2J_ev = _depressed_cubic_roots(-Ic, -2.0 * J)
     sig_max = wp.sqrt(Ic)
 
@@ -296,6 +349,10 @@ def _d2J_dF2_scale(J: float, Ic: float, J_scale: float, Id_scale: float):
 
 @wp.func
 def _depressed_cubic_roots(p: float, q: float):
+    """
+    Analytically computes the three real roots of the depressed cubic x^3 + p x + q = 0.
+    Used to estimate eigenvalues of the determinant Hessian.
+    """
     alpha = wp.sqrt(-p / 3.0)
     beta = wp.acos(1.5 * q / (p * alpha)) / 3.0
     return (
@@ -311,11 +368,18 @@ def _depressed_cubic_roots(p: float, q: float):
 
 @wp.func
 def symmetric_strain(sig: wp.vec3, V: wp.mat33):
+    """
+    Reconstructs the symmetric stretch tensor S = V diag(sig) V^T
+    from singular values and right singular vectors.
+    """
     return V * wp.diag(sig) * wp.transpose(V)
 
 
 @wp.func
 def symmetric_strain(F: wp.mat33):
+    """
+    Extracts the rotation-free symmetric stretch of F via SVD.
+    """
     U = wp.mat33()
     sig = wp.vec3()
     V = wp.mat33()
@@ -326,8 +390,11 @@ def symmetric_strain(F: wp.mat33):
 
 @wp.func
 def symmetric_strain_delta(U: wp.mat33, sig: wp.vec3, V: wp.mat33, dF: wp.mat33):
-    # see supplementary of `WRAPD: Weighted Rotation-aware ADMM`, Brown and Narain 21
-
+    """
+    Differential of the symmetric stretch tensor given SVD factors of F
+    and a deformation increment dF.
+    See supplementary of `WRAPD: Weighted Rotation-aware ADMM`, Brown and Narain 21.
+    """
     Ut = wp.transpose(U)
     Vt = wp.transpose(V)
 
@@ -343,8 +410,10 @@ def symmetric_strain_delta(U: wp.mat33, sig: wp.vec3, V: wp.mat33, dF: wp.mat33)
 
 @wp.func
 def symmetric_strain_delta(F: wp.mat33, dF: wp.mat33):
-    # see supplementary of `WRAPD: Weighted Rotation-aware ADMM`, Brown and Narain 21
-
+    """
+    Convenience overload: computes the SVD of F, then the stretch differential for dF.
+    See supplementary of `WRAPD: Weighted Rotation-aware ADMM`, Brown and Narain 21.
+    """
     U = wp.mat33()
     sig = wp.vec3()
     V = wp.mat33()
