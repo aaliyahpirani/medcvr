@@ -69,14 +69,32 @@ class FcData:
 
 
 def get_quadrature(model_path, cell_vtx, grid_sdf, cell_weights, clip=True, order=0, device="cuda"):
+    """
+    Produces integration points and weights for the given model and grid, give FcData. 
+
+    Args:
+        model path: path to neural network model (if it exists)
+        cell_vtx: the 8 grid-vertex nodes for each cube cell
+        grid_sdf: the signed distance function at each grid vertex 
+        cell_weights: the flexicubes weights for each cube cell
+        clip: whether to clip points to the surface 
+
+    Returns: 
+        It returns three arrays. quadrature points (per cell), quadrautre weights (per cell), and 
+        active cells (a mask of the cells that are in the object)
+    """
+    # if no weights are provided, use default as ones for all of them
     if cell_weights is None:
         cell_alphas = np.ones(cell_vtx.shape, dtype=float)
     else:
+        # otherwise, scale the weigts and use those for the alphas 
         cell_alphas = 1.0 + FC_WEIGHT_SCALE * np.tanh(cell_weights[:, 12:20])
 
+    # if no model path is provided, use regular quadrature 
     if model_path is None:
         return regular_quadrature(cell_vtx, grid_sdf, cell_alphas, clip=clip, order=order)
 
+    # otherwise, use learned quadrature 
     return neural_quadrature(model_path, cell_vtx, grid_sdf, cell_alphas)
 
 
@@ -170,20 +188,35 @@ def flexicubes_from_sdf_grid(
     output_tetmesh=False,
     device="cuda",
 ):
-    """Creates and serialize a Flexicubes datastructure from a SDF discretized on a dense grid"""
+    """Creates and serialize a Flexicubes datastructure from a SDF discretized on a dense grid.
+    
+    Args:
+        res: resolution
+        grid_node_sdf: sdf values at each grid node (8 per cell)
+        grid_node_pos: the positions of the grid node
+        sdf_grad_func: the gradient of the sdf function
+        output_tetmesh: whether to output a tetrahedral mesh 
+    Returns:
+        FcData: an object that contains the flexicubes data
+    """
 
     try:
         import torch
         from kaolin.non_commercial import FlexiCubes
 
+        # convert to torch tensors 
         grid_node_sdf = wp.to_torch(grid_node_sdf)
         grid_node_pos = wp.to_torch(grid_node_pos)
 
+        # create a flexicubes object 
         fc = FlexiCubes(device)
+        # construct a voxel grid of the correct resolution 
         _x_nx3, cube_fx8 = fc.construct_voxel_grid(res)
 
+        # initialize weights to 0
         weight = torch.zeros((cube_fx8.shape[0], 21), dtype=torch.float, device=device)
 
+        # create a Flexicubes object and assign the data to it 
         flexi = FcData(
             pos=grid_node_pos.detach().cpu().numpy(),
             sdf=grid_node_sdf.detach().cpu().numpy(),
@@ -192,6 +225,7 @@ def flexicubes_from_sdf_grid(
             stiffness=None,
         )
 
+        # run the flexicubes algorithm to extract the approximated geometry
         vertices, faces, L_dev = fc(
             voxelgrid_vertices=grid_node_pos,
             scalar_field=grid_node_sdf,
@@ -206,10 +240,12 @@ def flexicubes_from_sdf_grid(
             grad_func=sdf_grad_func,
         )
 
+        # if we want to output a tetrahedral mesh, assign vertices and faces to the tet fcdata object
         if output_tetmesh:
             flexi.tet_vertices = vertices.detach().cpu().numpy()
             flexi.tet_indices = faces.detach().cpu().numpy()
             flexi.vtx_displ = np.zeros(vertices.shape, dtype=np.float32)
+        # otherwise assign vertices and faces to the tri fcdata object
         else:
             flexi.tri_vertices = vertices.detach().cpu().numpy()
             flexi.tri_faces = faces.detach().cpu().numpy()
@@ -218,6 +254,7 @@ def flexicubes_from_sdf_grid(
         return flexi
 
     except ImportError:
+        # if we fail to import kaolin, fall back to the marching cubes algorithm
         wp.utils.warn("Failed to import kaolin flexicubes falling back wp wp.MarchingCubes")
 
         assert not output_tetmesh
