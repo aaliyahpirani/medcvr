@@ -76,7 +76,10 @@ def diff_bsr_mv(
 
 
 class MFEMSystem:
-    """Builds a linear operator corresponding to the saddle-point linear system [A B^T; B 0]"""
+    """Builds a linear operator corresponding to the saddle-point linear system [A B^T; B 0]
+    It is a container and solver for one MFEM newton linear system. It stores sparse blocks of the
+    saddle-point matrix for the F = RS formulation. 
+    """
 
     def __init__(
         self,
@@ -97,6 +100,16 @@ class MFEMSystem:
         self._Cr = Cr
 
     def cast(self, scalar_type):
+        """
+        Rebuilds the whole MFEM system with a new scalar type. It is used when the solve requires 
+        a high precision than the assembled matrices. 
+
+        Args:
+            scalar_type: the new scalar type
+
+        Returns:
+            A new MFEMSystem with the new scalar type
+        """
         if wp.types.types_equal(scalar_type, self._A.scalar_type):
             return self
 
@@ -117,6 +130,21 @@ class MFEMSystem:
         work_arrays=None,
         reuse_topology=False,
     ):
+        """
+        Newton linear solver for the full MFEM saddle-point system. Takes the RHS residual tuple
+        and returns the Newton step. (contains mainly math)
+
+        Args:
+            lhs: the MFEM system
+            rhs: tuple of residual vectors for the newton system, including displacement, stress, rotation and constraint 
+            tol: tlerance
+            max_iters: maximum number of iterations
+            work_arrays: scratch
+            reuse_topology: whether to reuse, quicker if sparsity pattern is known
+
+        Returns:
+            Tuple of newton correction for displaement, correction for symmetric field S, corretion for roataion and lagrange multipliers. 
+        """
         rhs_type = wp.types.type_scalar_type(rhs[0].dtype)
         lhs_type = lhs._A.scalar_type
 
@@ -266,6 +294,9 @@ class MFEMSystem:
         work_arrays=None,
         reuse_topology=False,
     ):
+        """
+        Same newton solve as solve_schur, but doesn't solve for rotation unknowns. 
+        """
         u_rhs, f, w_lambda, c_k = rhs
 
         A = lhs._A
@@ -353,6 +384,9 @@ class MFEMSystem:
 
 @wp.func
 def invert_schur_block(M: Any):
+    """
+    Inverts a schur block and returns the inverse. 
+    """
     eps = type(M[0])(M.dtype(1.0e-16))
     return inverse_qr(M + wp.diag(eps))
 
@@ -368,6 +402,9 @@ def compute_first_schur(
     f: wp.array(dtype=Any),
     w_lambda: wp.array(dtype=Any),
 ):
+    """
+    Builds the first schur complement for the full MFEM saddle-point system. 
+    """
     i = wp.tid()
 
     cr = Cr[i]
@@ -383,6 +420,19 @@ def compute_first_schur(
 
 
 @wp.kernel
+def compute_first_schur_no_R(
+    CHiC_inv: wp.array(dtype=Any),
+    Csi: wp.array(dtype=Any),
+    H: wp.array(dtype=Any),
+):  
+    """
+    Builds the first schur complement without rotation unknowns. 
+    """
+    i = wp.tid()
+
+    CHiC_inv[i] = Csi[i] * H[i] * Csi[i]
+
+@wp.kernel
 def compute_dLambdadRdS(
     Cs: wp.array(dtype=Any),
     Cr: wp.array(dtype=Any),
@@ -395,23 +445,16 @@ def compute_dLambdadRdS(
     dLambda: wp.array(dtype=Any),
     dS: wp.array(dtype=Any),
     dR: wp.array(dtype=Any),
-):
+): 
+    """
+    Back substitution kernel after solving the first schur complement.
+    It recovers the other newton corrections for displcement, stress, and rotation. 
+    """
     i = wp.tid()
     dL = -C_inv[i] * lambda_rhs[i]
     dLambda[i] = dL
     dS[i] = -H_inv[i] * (f[i] + wp.transpose(Cs[i]) * dL)
     dR[i] = -W_inv[i] * (w_lambda[i] + wp.transpose(Cr[i]) * dL)
-
-
-@wp.kernel
-def compute_first_schur_no_R(
-    CHiC_inv: wp.array(dtype=Any),
-    Csi: wp.array(dtype=Any),
-    H: wp.array(dtype=Any),
-):
-    i = wp.tid()
-
-    CHiC_inv[i] = Csi[i] * H[i] * Csi[i]
 
 
 @wp.kernel
@@ -423,6 +466,10 @@ def compute_dLambdadS(
     dLambda: wp.array(dtype=Any),
     dS: wp.array(dtype=Any),
 ):
+    """
+    Back substitution kernel after solving the first schur complement without rotation unknowns.
+    It recovers the other newton corrections for displcement and lagrange multipliers. 
+    """
     i = wp.tid()
 
     dLambda[i] = -CHiC_inv[i] * lambda_rhs[i] - ci_f[i]
@@ -431,12 +478,23 @@ def compute_dLambdadS(
 
 @wp.kernel
 def invert_blocks(A: wp.array(dtype=Any), A_inv: wp.array(dtype=Any)):
+    """
+    Inverts a block by reading block A[i] and storing inverse in A_inv[i].
+    It assumes the block is well conditioned enough. 
+    """
     i = wp.tid()
     A_inv[i] = inverse_qr(A[i])
 
 
 @wp.kernel
 def invert_schur_blocks(values: wp.array(dtype=Any)):
+    """
+    Takes an array of blocks and inverts them by running invert_schur_block on each block.
+    Essentially a parallelized version of invert_schur_block. 
+
+    Args:
+        values: an array of blocks to invert 
+    """
     i = wp.tid()
 
     values[i] = invert_schur_block(values[i])
@@ -448,6 +506,14 @@ def bsr_mul_diag(
     Bt_columns: wp.array(dtype=int),
     C_values: wp.array(dtype=Any),
 ):
+    """
+    Right multiples a non zero block of a BSR matrix by a diagonal matrix. 
+
+    Args:
+        bt_values: non-zero values of a BSR matrix
+        bt_columns: the column index of each nonzero value
+        c_values: block-diagonal entires, one per column/node 
+    """
     i = wp.tid()
     col = Bt_columns[i]
     Bt_values[i] *= C_values[col]
