@@ -21,6 +21,9 @@ import warp.sparse as sp
 
 
 class LineSearch:
+    """
+    Base class for line search acceptance criteria. 
+    """
     def __init__(self, sim):
         self.sim = weakref.proxy(sim)
 
@@ -32,31 +35,67 @@ class LineSearch:
 
 
 class LineSearchNaiveCriterion(LineSearch):
+    """
+    Naive criterion for line search. 
+    """
     def __init__(self, sim):
         super().__init__(sim)
-        self.penalty = sim.args.young_modulus
+        self.penalty = sim.args.young_modulus # default penalty for the constraint 
 
     def build_linear_model(self, sim, lhs, rhs, delta_fields):
         pass
 
     def accept(self, alpha, E_cur, C_cur, E_ref, C_ref):
-        f_cur = E_cur + self.penalty * C_cur
-        f_ref = E_ref + self.penalty * C_ref
-        return f_cur <= f_ref
+        """
+        Acceptance criterion for the naive line search. A trial step is accepted if a single
+        penalized cost does not increase. 
+
+        Args:
+            alpha: the step size 
+            E_cur: the current elastic energy
+            C_cur: the current constraint violation
+            E_ref: the elastic energy before this newton attempt
+            C_ref: the constraint before this newton attempt
+
+        """
+        f_cur = E_cur + self.penalty * C_cur # build the current cost 
+        f_ref = E_ref + self.penalty * C_ref # build the previous cost
+        return f_cur <= f_ref # accept the step if the current cost is lower 
 
 
 class LineSearchUnconstrainedArmijoCriterion(LineSearch):
+    """
+    Unconstrained Armijo criterion for line search. 
+    """
     def __init__(self, sim):
         super().__init__(sim)
         self.armijo_coeff = 0.0001
 
     def build_linear_model(self, lhs, rhs, delta_fields):
+        """
+        Computes the first order prediction of how energy changes along the newton direction. 
+        """
+        # unpack the search direction in displacement space 
         (delta_u,) = delta_fields
 
+        # compute the direction derivative of the energy along the delta 
         m = -wp.utils.array_inner(delta_u, self.sim._minus_dE_du.view(delta_u.dtype))
+        # store the linear prediction 
         self.m = m
 
     def accept(self, alpha, E_cur, C_cur, E_ref, C_ref):
+        """
+        Acceptance criterion for the unconstrained Armijo line search. 
+        Accept if actual energy is at most the linear prediction plus a small constant. 
+
+        Args:
+            alpha: step size
+            E_cur: energy after trial step
+            C_cur: constraint violation after trial step
+            E_ref: energy before trial step
+            C_ref: constraint violation before trial step
+        """
+        # return if smaller than the linear prediction plus a small constant 
         return E_cur <= E_ref + self.armijo_coeff * alpha * self.m
 
 
@@ -68,30 +107,56 @@ class LineSearchMeritCriterion(LineSearch):
         self.armijo_coeff = 0.0001
 
     def build_linear_model(self, lhs, rhs, delta_fields):
+        """
+        Computes the predicted slope of the merit function along the newton direction. 
+
+        Args: 
+            lhs: the newton LHS
+            rhs: the newton RHS
+            delta_fields: the search direction in displacement, stress, and constraint space
+        """
+        # unpack the search direction for displacement, stress, and rigid variables
         delta_u, dS, dR, dLambda = delta_fields
 
+        # unpack the constraint vector 
         c_k = rhs[3]
-        c_k_normalized = wp.empty_like(c_k)
+        c_k_normalized = wp.empty_like(c_k) # allocate memory 
 
+        # normalize the constraint vector 
         wp.launch(
             self._normalize_c_k,
             inputs=[c_k, c_k_normalized, self.sim._stiffness_field.dof_values],
             dim=c_k.shape,
         )
 
+        # predict the constraint change from displacement 
         delta_ck = lhs._B @ delta_u
+        # add the contribution from the stress change
         sp.bsr_mv(A=lhs._Cs, x=dS, y=delta_ck, alpha=-1.0, beta=1.0)
 
+        # subtract contribution from the rigid variables 
         if lhs._Cr is not None:
             sp.bsr_mv(A=lhs._Cr, x=dR, y=delta_ck, alpha=-1.0, beta=1.0)
 
+        # compute the predicted slope of the merit function along the newton direction
         m = wp.utils.array_inner(dS, self.sim._dE_dS.view(dS.dtype)) - wp.utils.array_inner(
             delta_u, self.sim._minus_dE_du.view(delta_u.dtype)
         ) * wp.utils.array_inner(c_k_normalized, delta_ck.view(c_k_normalized.dtype))
 
+        # store the linear prediction 
         self.m = m
 
     def accept(self, alpha, E_cur, C_cur, E_ref, C_ref):
+        """
+        Acceptance criterion for the merit line search. 
+
+        Args:
+            alpha: step size
+            E_cur: energy after trial step
+            C_cur: constraint violation after trial step
+            E_ref: energy before trial step
+            C_ref: constraint violation before trial step
+        """
         f_cur = E_cur + C_cur
         f_ref = E_ref + C_ref
 
@@ -103,6 +168,14 @@ class LineSearchMeritCriterion(LineSearch):
         c_k_norm: wp.array(dtype=Any),
         scale: wp.array(dtype=float),
     ):
+        """
+        Normalizes the constraint vector.
+
+        Args:
+            c_k: constraint vector
+            c_k_norm: magnitude of constraint vector
+            scale: scaling factor 
+        """
         i = wp.tid()
         c_k_norm[i] = wp.normalize(c_k[i]) * scale[i]
 
@@ -126,43 +199,90 @@ class LineSearchMultiObjCriterion(LineSearch):
         self.armijo_coeff = 0.0001
 
     def build_linear_model(self, lhs, rhs, delta_fields):
+        """
+        Computes the predicted slope of multi objective line search, treating energy and constraints as two seperate goals. 
+        """
+        # unpack the search direction for displacement and stress 
         delta_u, dS, dR, dLambda = delta_fields
+        # compute the predicted slope of energy along the step, with contributions from dtress and displacement 
         m = wp.utils.array_inner(dS, self.sim._dE_dS.view(dS.dtype)) - wp.utils.array_inner(
             delta_u, self.sim._minus_dE_du.view(delta_u.dtype)
         )
         self.m = m
 
     def accept(self, alpha, E_cur, C_cur, E_ref, C_ref):
+        """
+        Acceptance criterion for multi objective line search.
+
+        Args:
+            alpha: step size
+            E_cur: energy after trial step
+            C_cur: constraint violation after trial step
+            E_ref: energy before trial step
+            C_ref: constraint violation before trial step
+        """
+        # if the step is decreasing energy and the predicted decrease is large
         if self.m < 0.0 and (-self.m) ** self.s_rho * alpha > self.delta * C_ref**self.s_theta:
+            # prioritize energy decrease 
             return E_cur <= E_ref + self.armijo_coeff * alpha * self.m
 
+        # otherwise, prioritize constraint decrease
         return C_cur <= (1.0 - self.gamma_theta) * C_ref or (E_cur <= E_ref - self.gamma_f * C_ref)
 
 
 class LineSearchLagrangianArmijoCriterion(LineSearch):
-    # Unconstrained line-search based on Lagrangian
-
+    """
+    Unconstrained line-search based on Lagrangian. We minimize energy without any constraints.
+    """
     def __init__(self, sim):
         super().__init__(sim)
         self.armijo_coeff = 0.0001
 
     def build_linear_model(self, lhs, rhs, delta_fields):
+        """
+        Slope of the lagranian function along the newton direction. 
+
+        Args:
+            lhs: the newton LHS
+            rhs: the newton RHS
+            delta_fields: search direction in displacement, stress, rotation and multiplier
+        """
+        # unpack search directions
         delta_u, dS, dR, dLambda = delta_fields
 
+        # compute the directional derivative of energy along dS and delta_u
         m = wp.utils.array_inner(dS, self.sim._dE_dS.view(dS.dtype)) - wp.utils.array_inner(
             delta_u, self.sim._minus_dE_du.view(delta_u.dtype)
         )
 
+        # current constraint residual 
         c_k = rhs[3]
+        # predicted constraint residual 
         delta_ck = lhs._B @ delta_u
+        # add contribution frm the stress change
         sp.bsr_mv(A=lhs._Cs, x=dS, y=delta_ck, alpha=-1.0, beta=1.0)
+        # if there are rotation varibles, add contribution 
         if lhs._Cr is not None:
             sp.bsr_mv(A=lhs._Cr, x=dR, y=delta_ck, alpha=-1.0, beta=1.0)
 
+        # constraint/multiplier contribution 
         c_m = wp.utils.array_inner(c_k, dLambda.view(c_k.dtype)) + wp.utils.array_inner(
             delta_ck, self.sim.constraint_field.dof_values.view(delta_ck.dtype)
         )
+        # store the linear prediction 
         self.m = m - c_m
 
     def accept(self, alpha, E_cur, C_cur, E_ref, C_ref):
+        """
+        Acceptance criterion for the Lagrangian line search.
+
+        Args:
+            alpha: step size
+            E_cur: energy after trial step
+            C_cur: constraint violation after trial step
+            E_ref: energy before trial step
+            C_ref: constraint violation before trial step
+        """
+        # return if current cost is less than predicted cost plus a small constant 
         return E_cur + C_cur <= E_ref + C_ref + self.armijo_coeff * alpha * self.m
+

@@ -92,9 +92,20 @@ class CollisionHandler:
         self.n_contact = 0
 
     def init_collision_detector(self, sim: ReferenceType[SoftbodySim]):
+        """
+        Initializes the collision detector.
+
+        Args:
+            sim: the softbody simulation
+
+        Returns:
+            None
+        """
+        # stores arguments
         self.args = sim.args
         self.sim = sim  # weakref
 
+        # initialize all the arrays to work with
         n_cp = self.cp_cell_indices.shape[0]
         collision_quadrature = fem.PicQuadrature(
             domain=sim.vel_quadrature.domain,
@@ -126,11 +137,15 @@ class CollisionHandler:
         self.collision_quadrature = quadrature
 
     def add_collision_energy(self, E: wp.array):
+        # if no contacts, return current energy
         if self.n_contact == 0:
             return E
 
+        # get the displacement of the collision quadrature points
         cp_du = self._sample_cp_displacement(self.sim.du_field)
+        # store empty space for each of the collision energies
         col_energies = wp.empty(self.n_contact, dtype=float)
+        # launch collision energy kernel
         wp.launch(
             collision_energy,
             dim=self.n_contact,
@@ -147,26 +162,33 @@ class CollisionHandler:
                 col_energies,
             ],
         )
+        # sum the collision energies
         Ec = wp.empty_like(E)
         wp.utils.array_sum(col_energies, out=Ec)
 
+        # add collision energy to total energy (multiplied by collision stiffness)
         fem.utils.array_axpy(x=Ec, y=E, alpha=self._collision_stiffness, beta=1.0)
 
+        # return the total energy
         return E
 
     def add_collision_hessian(self, lhs: wp.array):
-        # contacts
+        # if no contacts, return current hessian
         if self.n_contact == 0:
             return lhs
 
+        # get collision jacobian and transpose 
         H = self._collision_jacobian
         Ht = self._collision_jacobian_t
+
+        # launch kernel to multiply BSR matrix by diagonal matrix
         wp.launch(
             bsr_mul_diag,
             dim=(Ht.nnz_sync(), Ht.block_shape[0]),
             inputs=[Ht.scalar_values, Ht.columns, self._col_energy_hessian],
         )
 
+        # adds collision stiffness to the hessian
         sp.bsr_mm(
             x=Ht,
             y=H,
@@ -176,9 +198,20 @@ class CollisionHandler:
             work_arrays=self._HtH_work_arrays,
         )
 
+        # return the updated hessian
         return lhs
 
     def add_collision_forces(self, rhs: wp.array):
+        """
+        Converts per-contact collision gradients into nodal collision forces and adds them to rhs. 
+
+        Args: 
+            rhs: the rhs of the linear system
+
+        Returns:
+            None. Updates rhs with collision forces
+        """
+        # if no contacts, return current forces
         if self.n_contact == 0:
             return rhs
 
@@ -194,16 +227,24 @@ class CollisionHandler:
         return rhs
 
     def prepare_newton_step(self, dt: float):
+        """
+        
+        """
+        # runs collision detection, builds collision jacobian 
+        # the goal is to find the currently active contacts and their hessian
         self.detect_collisions(dt)
         self.build_collision_jacobian()
 
         # compute per-contact forces and hessian
         n_contact = self.n_contact
         if n_contact > 0:
+            # store empty space for per-contact collision gradients and hessian
             self._col_energy_gradients = wp.empty(n_contact, dtype=wp.vec3)
             self._col_energy_hessian = wp.empty(n_contact, dtype=wp.mat33)
+            # store the displacement of the collision quadrature points
             cp_du = self._sample_cp_displacement(self.sim.du_field)
 
+            # launch kernel to compute per-contact collision gradients and hessian
             wp.launch(
                 collision_gradient_and_hessian,
                 dim=n_contact,
@@ -496,6 +537,9 @@ class CollisionHandler:
 
 
 class MeshSelfCollisionHandler(CollisionHandler):
+    """
+    A collision handler that detects self collisions in addition to the ground/kinetmatic mesh collisions.
+    """
     def __init__(
         self,
         vtx_quadrature: fem.PicQuadrature,
@@ -622,8 +666,11 @@ class MeshSelfCollisionHandler(CollisionHandler):
 
 
 class CollisionPotential(DisplacementPotential):
+    """
+    """
     def __init__(self, sim: SoftbodySim, collision_handler: CollisionHandler):
         super().__init__(sim)
+        # store the collision handler
         self.collision_handler = collision_handler
 
     def prepare_frame(self, dt):
@@ -654,13 +701,25 @@ def bsr_mul_diag(
     Bt_columns: wp.array(dtype=int),
     C_values: wp.array(dtype=Any),
 ):
+    """
+    Kernel to multiply a BSR matrix by a diagonal matrix 
+
+    Args:
+        Bt_values: the values of the transp
+    """
+    # thread index
     i, r = wp.tid()
+    # get the column index
     col = Bt_columns[i]
 
+    # get the value of the diagonal matrix at the column index
     C = C_values[col]
 
+    # get value of BSR matrix
     Btr = Bt_values[i, r]
+    # multiply BSR matrix by diagonal matrix
     BtC = wp.vec3(Btr[0], Btr[1], Btr[2]) @ C
+    # store result
     for k in range(3):
         Btr[k] = BtC[k]
 
