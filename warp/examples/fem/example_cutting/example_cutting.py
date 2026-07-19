@@ -354,10 +354,17 @@ def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.a
     force_center_quadrature = None
     flexicubes_data = flexicubes
     sculpt_rebuild_count = 0
+    tear_force_threshold = args.tear_force_threshold
+    tear_threshold_reached = False
+    debug_print(
+        "Registered tearing force:",
+        f"threshold={tear_force_threshold}",
+    )
 
     # user interface callback
     def callback():
         nonlocal prev_world_pos, force_center_quadrature, frame_id, flexicubes_data, sculpt_rebuild_count
+        nonlocal tear_threshold_reached
 
         io = psim.GetIO()
 
@@ -491,6 +498,7 @@ def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.a
                     clay.volumetric_forces.forces.forces.zero_()
                     clay.volumetric_forces.forces.centers = rest_pos
                     clay.volumetric_forces.update_force_weight()
+                    tear_threshold_reached = False
 
                     # embed force center so we can move it with the sim
                     force_center_quadrature = fem.PicQuadrature(fem.Cells(sim.geo), rest_pos, max_dist=2.0 / res)
@@ -520,7 +528,14 @@ def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.a
                 perp = ray_orig - deformed_force_center
                 perp -= np.dot(perp, ray_dir) * ray_dir
 
-                clay.volumetric_forces.forces.forces = wp.array([perp * args.force_scale], dtype=wp.vec3)
+                applied_force = perp * args.force_scale
+                clay.volumetric_forces.forces.forces = wp.array([applied_force], dtype=wp.vec3)
+
+                # Tear threshold: compare applied picking force magnitude
+                applied_force_mag = float(np.linalg.norm(applied_force))
+                if applied_force_mag >= tear_force_threshold and not tear_threshold_reached:
+                    tear_threshold_reached = True
+                    print("threshold reached")
 
                 # force line visualization
                 ps.get_curve_network("force_line").update_node_positions(
@@ -532,6 +547,7 @@ def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.a
                 if clay.volumetric_forces.forces.count > 0:
                     debug_print("Picking force released")
                 clay.volumetric_forces.forces.count = 0
+                tear_threshold_reached = False
                 ps.get_curve_network("force_line").set_enabled(False)
 
             io.WantCaptureMouse = clay.volumetric_forces.forces.count > 0
@@ -590,6 +606,12 @@ if __name__ == "__main__":
         type=float,
         default=1.0,
         help="Scaling factor for dynamic picking forces",
+    )
+    parser.add_argument(
+        "--tear_force_threshold",
+        type=float,
+        default=1.0,
+        help="Applied picking-force magnitude that triggers tearing (prints 'threshold reached')",
     )
     parser.add_argument(
         "--y_min",
