@@ -32,7 +32,7 @@ class CollisionHandler:
             "--collision_stiffness",
             "-ck",
             type=float,
-            default=1.0,
+            default=0.1,
             help="Multiplier for collision force/energy",
         )
         parser.add_argument(

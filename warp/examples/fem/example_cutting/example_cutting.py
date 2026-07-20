@@ -110,6 +110,68 @@ def deformed_position(s: fem.Sample, domain: fem.Domain, displacement: fem.Field
     return domain(s) + displacement(s)
 
 
+def load_stiffness_scale_config(path: str):
+    """Load a stiffness scale config (.json) or a raw per-node scale array (.npy/.npz)."""
+    path = str(path)
+    if path.endswith(".json"):
+        import json
+
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        return {
+            "mode": "left_right",
+            "left_scale": float(cfg.get("left_scale", 1.0)),
+            "right_scale": float(cfg.get("right_scale", 1.0)),
+            "axis": int(cfg.get("axis", 0)),
+        }
+    if path.endswith(".npz"):
+        data = np.load(path)
+        if "scales" in data:
+            return {"mode": "array", "scales": np.asarray(data["scales"], dtype=np.float32)}
+        return {
+            "mode": "left_right",
+            "left_scale": float(data["left_scale"]) if "left_scale" in data else 1.0,
+            "right_scale": float(data["right_scale"]) if "right_scale" in data else 1.0,
+            "axis": int(data["axis"]) if "axis" in data else 0,
+        }
+    # .npy raw vector
+    return {"mode": "array", "scales": np.load(path).astype(np.float32)}
+
+
+def apply_stiffness_scale_config(sim, config):
+    """Apply a stiffness config to the sim's Lamé field."""
+    if config is None:
+        return
+    if config["mode"] == "array":
+        scales = config["scales"]
+        n = sim.lame_field.dof_values.shape[0]
+        if scales.shape[0] != n:
+            raise ValueError(
+                f"Stiffness scale array length {scales.shape[0]} does not match "
+                f"Lamé node count {n}. Regenerate for this --resolution."
+            )
+        sim.scale_lame_field(wp.array(scales, dtype=float))
+        debug_print("Applied per-node stiffness file:", f"nodes={n}")
+        return
+
+    axis = config["axis"]
+    left_scale = config["left_scale"]
+    right_scale = config["right_scale"]
+    pos = sim.lame_field.space.node_positions().numpy()
+    t = np.clip(0.5 * (pos[:, axis] + 1.0), 0.0, 1.0)
+    # Hard half-split: left (t < 0.5) vs right (t >= 0.5)
+    scales = np.where(t < 0.5, left_scale, right_scale).astype(np.float32)
+    sim.scale_lame_field(wp.array(scales, dtype=float))
+    debug_print(
+        "Applied left/right stiffness:",
+        f"axis={axis}",
+        f"left_scale={left_scale}",
+        f"right_scale={right_scale}",
+        f"n_left={int(np.sum(t < 0.5))}",
+        f"n_right={int(np.sum(t >= 0.5))}",
+    )
+
+
 @wp.kernel
 def world_to_rest_pose_kernel(
     mesh: wp.uint64,
@@ -205,7 +267,7 @@ def sculpt_sdf(
 
     # the change in sdf is e^(-falloff * dist_sq)
     delta_sdf = wp.exp(-falloff * dist_sq)
-    grid_sdf[i] += (amount * delta_sdf) / 50.0 # add to the sdf value 
+    grid_sdf[i] += (amount * delta_sdf) / 100.0 # add to the sdf value 
 
 
 @wp.kernel
@@ -301,6 +363,8 @@ class Clay:
         self.volumetric_forces = VolumetricForcePotential(self.sim, reserve_count=1)
         self.volumetric_forces.forces.radii.fill_(2.0 / res)
         self.sim.add_energy_potential(self.volumetric_forces)
+        if getattr(args, "stiffness_file", None):
+            apply_stiffness_scale_config(self.sim, load_stiffness_scale_config(args.stiffness_file))
         debug_print("Simulation created")
 
     def is_initialized(self):
@@ -606,6 +670,12 @@ if __name__ == "__main__":
         type=float,
         default=1.0,
         help="Scaling factor for dynamic picking forces",
+    )
+    parser.add_argument(
+        "--stiffness_file",
+        type=str,
+        default=None,
+        help="JSON/NPZ/NPY stiffness scales (e.g. stiffness_left_normal_right_half.json)",
     )
     parser.add_argument(
         "--tear_force_threshold",

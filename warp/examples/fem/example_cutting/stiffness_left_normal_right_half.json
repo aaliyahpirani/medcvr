@@ -1,0 +1,8 @@
+{
+  "description": "Left half (low X) keeps normal stiffness; right half (high X) is half as stiff.",
+  "left_scale": 1.0,
+  "right_scale": 0.5,
+  "axis": 0,
+  "axis_name": "X",
+  "note": "Scales are blended across the normalized grid in [-1, 1]. Applied to Lamé parameters via scale_lame_field."
+}
