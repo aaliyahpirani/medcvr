@@ -2,10 +2,19 @@
 
 # /// script
 # dependencies = [
-#     "torch==2.5.1",
+#     "torch>=2.5.1",
 #     "warp-lang",
 #     "matplotlib",
 #     "pyqt5",
+# ]
+# [[tool.uv.index]]
+# name = "pytorch-cu124"
+# url = "https://download.pytorch.org/whl/cu124"
+# explicit = true
+#
+# [tool.uv.sources]
+# torch = [
+#   { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 # ]
 # ///
 
@@ -31,7 +40,7 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument("-d", "--dim", type=int, default=3, help="dimension of the space")
 parser.add_argument("-o", "--order", type=int, default=2, help="order of the quadrature")
-parser.add_argument("-i", "--iters", type=int, default=64000, help="number of iterations")
+parser.add_argument("-i", "--iters", type=int, default=5000, help="number of iterations")
 parser.add_argument("--n_train", type=int, default=24, help="number of training samples")
 parser.add_argument("--n_test", type=int, default=10, help="number of test samples")
 parser.add_argument("--n_batches", type=int, default=16, help="number of batches")
@@ -86,16 +95,19 @@ criterion = Loss(
 criterion_scripted = torch.jit.script(criterion)  # Export to TorchScript
 
 # Create Tensors to hold input and outputs.
-
+# input for training and testing 
 ipt_train = torch.empty((N_TRAIN, INPUTS), dtype=torch.float32, device=device)
 ipt_test = torch.empty((N_TEST, INPUTS), dtype=torch.float32, device=device)
 
+# target for training and testing
 tgt_train = torch.empty((N_TRAIN, *((BASIS_DIM,) * DIM)), dtype=torch.float32, device=device)
 tgt_test = torch.empty((N_TEST, *((BASIS_DIM,) * DIM)), dtype=torch.float32, device=device)
 
+# generate random inputs for training and testing 
 with wp.ScopedTimer(f"Generating {N_TRAIN} train + {N_TEST} test random cells...", synchronize=True):
     gen_random_inputs((ipt_train, ipt_test))
 
+# generate the ground truth for training and testing
 print("Generating ground truth...")
 with wp.ScopedTimer("Generating ground truth", synchronize=True):
     gen_ground_truth(
@@ -106,12 +118,15 @@ with wp.ScopedTimer("Generating ground truth", synchronize=True):
         gt_res=args.gt_res,
     )
 
-# Start training
+# optimizer applies the new step 
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+# adjusts the learning rate over time, rate of 1 means it doesnt change anything
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda x: 1.0)
 
+# returns a clock value in seconds 
 start_time = time.monotonic()
 
+# iterates 
 for t in range(args.iters + 1):
     optimizer.zero_grad()
 
@@ -127,8 +142,8 @@ for t in range(args.iters + 1):
     loss = criterion_scripted(*y_pred, tgt_batch)
 
     # Zero gradients, perform a backward pass, and update the weights.
-    loss.backward()
-    optimizer.step()
+    loss.backward() # clear the gradients, perform a backward pass
+    optimizer.step() # update the weights 
     scheduler.step()
 
     # print loss

@@ -1,20 +1,26 @@
 #! /usr/bin/env uv run --script
 
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.10,<3.13"
 # dependencies = [
-#     "kaolin==0.17.0",
+#     "kaolin==0.18.0",
 #     "polyscope==2.1",
-#     "torch==2.5.1",
-#     "warp-lang==1.9.0dev20250801",
+#     "torch==2.8.0",
 #     "torchvision",
+#     "warp-lang==1.9.0dev20250801",
 #     "trimesh",
 #     "meshio",
 # ]
 # [tool.uv]
-# find-links = ["https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.5.1_cu124.html"]
+# find-links = ["https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.8.0_cu128.html"]
 # [tool.uv.sources]
-# warp-lang = { index = "nvidia"}
+# torch = { index = "pytorch-cu128" }
+# torchvision = { index = "pytorch-cu128" }
+# warp-lang = { index = "nvidia" }
+# [[tool.uv.index]]
+# name = "pytorch-cu128"
+# url = "https://download.pytorch.org/whl/cu128"
+# explicit = true
 # [[tool.uv.index]]
 # name = "nvidia"
 # url = "https://pypi.nvidia.com"
@@ -398,13 +404,86 @@ class Clay:
         )
         return rest_pos
 
+def _voxel_hex_edges():
+    """Local edge pairs for a hex cell (FlexiCubes / grid corner ordering)."""
+    return np.array(
+        [
+            [0, 1],
+            [1, 3],
+            [3, 2],
+            [2, 0],
+            [4, 5],
+            [5, 7],
+            [7, 6],
+            [6, 4],
+            [0, 4],
+            [1, 5],
+            [2, 6],
+            [3, 7],
+        ],
+        dtype=np.int32,
+    )
+
+
 def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.array, flexicubes):
     """Setups an interactive polyscope viewer and register hooks for sculpting and picking"""
 
     import polyscope as ps
     import polyscope.imgui as psim
 
+    show_voxel_grid = bool(getattr(args, "show_voxel_grid", False))
+    show_voxel_nodes = True
+    show_voxel_cells = True
+
     # Add hooks for displaying surface and run sim
+
+    def register_voxel_grid(flexicubes):
+        """Register active-cell nodes and their hex-edge connectivity (rest pose)."""
+        pos = np.asarray(flexicubes.pos, dtype=np.float32)
+        sdf = np.asarray(flexicubes.sdf, dtype=np.float32).reshape(-1)
+        cubes = np.asarray(flexicubes.cubes, dtype=np.int32)
+
+        cell_sdf = sdf[cubes]
+        active = np.min(cell_sdf, axis=1) <= 0.0
+        active_cubes = cubes[active]
+
+        if active_cubes.size == 0:
+            node_idx = np.zeros(0, dtype=np.int32)
+            node_pos = np.zeros((0, 3), dtype=np.float32)
+            edges = np.zeros((0, 2), dtype=np.int32)
+        else:
+            node_idx = np.unique(active_cubes.reshape(-1))
+            # Map global grid indices -> compact local indices for the curve network
+            global_to_local = -np.ones(pos.shape[0], dtype=np.int32)
+            global_to_local[node_idx] = np.arange(node_idx.shape[0], dtype=np.int32)
+            node_pos = pos[node_idx]
+            local_edges = _voxel_hex_edges()
+            global_edges = active_cubes[:, local_edges].reshape(-1, 2)
+            edges = global_to_local[global_edges]
+
+        pc = ps.register_point_cloud(
+            "voxel_nodes",
+            node_pos,
+            radius=0.0015,
+            enabled=show_voxel_grid and show_voxel_nodes,
+        )
+        if node_idx.size:
+            pc.add_scalar_quantity("sdf", sdf[node_idx], enabled=True)
+
+        cn = ps.register_curve_network(
+            "voxel_grid",
+            node_pos,
+            edges,
+            radius=0.0004,
+            enabled=show_voxel_grid and show_voxel_cells,
+        )
+        cn.set_color((0.2, 0.75, 1.0))
+        debug_print(
+            "Registered voxel grid:",
+            f"active_cells={int(np.count_nonzero(active))}",
+            f"active_nodes={int(node_idx.size)}",
+            f"edges={edges.shape[0]}",
+        )
 
     def register_ps_meshes(flexicubes, sim, first_frame=False):
         tri_vertices = flexicubes.tri_vertices
@@ -412,6 +491,7 @@ def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.a
 
         surface = ps.register_surface_mesh("surf", tri_vertices, tri_faces)
         surface.set_edge_width(1.0)
+        register_voxel_grid(flexicubes)
 
     prev_world_pos = None
     frame_id = 0
@@ -429,8 +509,20 @@ def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.a
     def callback():
         nonlocal prev_world_pos, force_center_quadrature, frame_id, flexicubes_data, sculpt_rebuild_count
         nonlocal tear_threshold_reached
+        nonlocal show_voxel_grid, show_voxel_nodes, show_voxel_cells
 
         io = psim.GetIO()
+
+        if psim.TreeNode("Voxel grid"):
+            _, show_voxel_grid = psim.Checkbox("Enable overlay", show_voxel_grid)
+            _, show_voxel_nodes = psim.Checkbox("Show active-cell nodes", show_voxel_nodes)
+            _, show_voxel_cells = psim.Checkbox("Show connectivity", show_voxel_cells)
+            try:
+                ps.get_point_cloud("voxel_nodes").set_enabled(show_voxel_grid and show_voxel_nodes)
+                ps.get_curve_network("voxel_grid").set_enabled(show_voxel_grid and show_voxel_cells)
+            except ValueError:
+                pass
+            psim.TreePop()
 
         ctrl = getattr(psim, "ImGuiKeyModFlags_Ctrl", None) or psim.ImGuiModFlags_Ctrl
         shift = getattr(psim, "ImGuiKeyModFlags_Shift", None) or psim.ImGuiModFlags_Shift
@@ -705,6 +797,11 @@ if __name__ == "__main__":
         "--debug",
         action="store_true",
         help="Print setup and interaction details for debugging",
+    )
+    parser.add_argument(
+        "--show_voxel_grid",
+        action="store_true",
+        help="Overlay the rest-pose SDF voxel grid (nodes + active cell wireframe) in the viewer",
     )
 
     sim_class.add_parser_arguments(parser)

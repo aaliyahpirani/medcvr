@@ -3,14 +3,18 @@
 This example demonstrates an interactive 3D cutting and sculpting simulation using NVIDIA Warp's FEM submodule. The simulation allows real-time manipulation, cutting and sculpting of deformable objects.
 
 Optionally, this example may use:
+
 - **Neural quadrature integration** for enhanced numerical accuracy, as described in [Neurally Integrated Finite Elements for Differentiable Elasticity on Evolving Domains](https://research.nvidia.com/labs/toronto-ai/flexisim/) (ACM Transactions on Graphics, 2025)
 - **FlexiCubes** for surface extraction from the sculpted SDF, as described in [Flexible Isosurface Extraction for Gradient-Based Mesh Optimization](https://research.nvidia.com/labs/toronto-ai/flexicubes/) (SIGGRAPH 2023)
+
+
 
 ## Requirements
 
 The easiest way to run these scripts is to install [uv](https://docs.astral.sh/uv/getting-started/installation/), which will automatically handle all Python dependencies.
 
 **Install uv:**
+
 ```bash
 # On macOS and Linux
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -24,6 +28,7 @@ pip install uv
 
 **Alternative manual installation:**
 If you prefer to manage dependencies manually, you'll need:
+
 - Python ≥ 3.10
 - warp-lang≥1.8.1, recommended≥1.9.0dev20250801 (e.g. the version from this branch)
 - polyscope==2.1.*
@@ -35,6 +40,8 @@ If you prefer to manage dependencies manually, you'll need:
 
 ## Usage
 
+
+
 ### Main Interactive Cutting Script
 
 ```bash
@@ -42,12 +49,13 @@ uv run example_cutting.py /path/to/mesh.obj [OPTIONS]
 ```
 
 A classical test subject is the Armadillo mesh from the [The Stanford 3D Scanning Repository](https://graphics.stanford.edu/data/3Dscanrep/)
+
 ```bash
 uv run --script example_cutting.py -nh Armadillo.ply --y_min -0.5 --y_max 1.5 
 ```
 
-
 **Basic Usage:**
+
 ```bash
 # Run with default settings
 uv run example_cutting.py /path/to/mesh.obj
@@ -65,9 +73,11 @@ uv run example_cutting.py /path/to/mesh.obj --levels 2
 **Command-line Options:**
 
 **Required:**
+
 - `mesh` - Path to the input mesh file (.obj format)
 
 **Optional:**
+
 - `--quadrature_model`, `-qm` - Path to saved neural quadrature MLP weights. If not provided, uses regular quadrature
 - `--variant`, `-v` - Simulation variant: `classic` (default), `mfem`, or `trusty22`
 - `--resolution` - Grid resolution at finest level (default: 64)
@@ -84,6 +94,8 @@ Additional simulation-specific options are available depending on the chosen var
 - **Ctrl+right mouse:** remove material
 - **Shift+left drag:** apply picking force
 
+
+
 ## Neural Quadrature Models (MLP)
 
 The `mlp/` folder contains scripts for training, testing, and visualizing neural quadrature models that can be used with the main cutting simulation. All scripts use `uv` for dependency management with dependencies listed at the top of each script.
@@ -98,6 +110,7 @@ uv run train.py [OPTIONS]
 ```
 
 **Training Options:**
+
 - `-d, --dim` - Dimension of the space (default: 3)
 - `-o, --order` - Order of the quadrature (default: 2)
 - `-i, --iters` - Number of training iterations (default: 64000)
@@ -112,6 +125,7 @@ uv run train.py [OPTIONS]
 - `--device` - Device to use: `cuda` or `cpu` (default: cuda)
 
 **Example:**
+
 ```bash
 # Train a 3D quadrature model with higher order
 uv run train.py -d 3 -o 4 -i 100000
@@ -119,6 +133,8 @@ uv run train.py -d 3 -o 4 -i 100000
 # Train with custom penalties
 uv run train.py --conditioning_pen 0.0001 --outside_coords_pen 5.0
 ```
+
+
 
 ### Visualizing Quadrature Results
 
@@ -130,9 +146,12 @@ uv run quadrature_viz.py model.pt
 ```
 
 This opens an interactive 3D visualization showing:
+
 - Quadrature points and their positions
 - Weight distributions
 - FlexiCubes mesh reconstruction
+
+
 
 ### Testing Quadrature Models
 
@@ -144,6 +163,7 @@ uv run test.py model1.pt [model2.pt ...] [OPTIONS]
 ```
 
 **Testing Options:**
+
 - `quadrature_models` - Path(s) to quadrature models, or predefined formulas: `clip`, `full`, `muller`
 - `-d, --dim` - Dimension of the space (default: 3)
 - `-o, --orders` - Order(s) of quadrature to test (default: 2)
@@ -154,6 +174,7 @@ uv run test.py model1.pt [model2.pt ...] [OPTIONS]
 - `--device` - Device to use (default: cuda)
 
 **Examples:**
+
 ```bash
 # Compare multiple models
 uv run test.py model1.pt model2.pt -l "Model 1" "Model 2"
@@ -166,6 +187,3 @@ uv run test.py model.pt -o 2 4 6
 ```
 
 The test script generates plots comparing integration accuracy and numerical conditioning across different methods.
-
- 
- 
