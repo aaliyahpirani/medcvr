@@ -56,6 +56,7 @@ from utils.embedded_sim_utils import (
 )
 
 import warp as wp
+import warp.examples.fem.utils as fem_example_utils
 import warp.fem as fem
 
 
@@ -276,6 +277,55 @@ def sculpt_sdf(
     grid_sdf[i] += (amount * delta_sdf) / 100.0 # add to the sdf value 
 
 
+@wp.func
+def refinement_field(xyz: wp.vec3, mesh: wp.uint64, surface_band: float, exterior_carve: float):
+    """
+    Refinement field, used to refine the grid based on the distance to the surface. 
+
+    Args:
+        xyz: the position to query
+        mesh: the mesh to query 
+        surface_band: the band width around the surface
+        exterior_carve: the distance to carve out far exterior voxels
+
+    """
+    # signed distance to the source mesh; used as the adaptive-grid refinement oracle
+    max_dist = 2.0  # search radius for the closest surface point
+    query = wp.mesh_query_point_sign_winding_number(mesh, xyz, max_dist)  # closest-point query with inside/outside sign
+
+    if query.result:
+        mesh_pos = wp.mesh_eval_position(mesh, query.face, query.u, query.v)  # reconstruct the closest surface point
+        sdf = query.sign * wp.length(xyz - mesh_pos)  # signed distance: negative inside the mesh
+    else:
+        sdf = 1.0  # treat missed queries as far outside
+
+    abs_sdf = wp.abs(sdf)  # distance to the surface, ignoring inside/outside
+    level = wp.min(abs_sdf / surface_band, 1.0)  # 0 at the surface (finest), 1 far away (coarsest)
+
+    if sdf > exterior_carve:
+        return 1.0 
+
+    return level  # keep interior and a band around the surface
+
+
+@wp.kernel
+def sdf_to_refinement_kernel(
+    sdf: wp.array(dtype=float),
+    surface_band: float,
+    exterior_carve: float,
+    refinement: wp.array(dtype=float),
+):
+    # map a sculpted nodal SDF onto the same refinement oracle used at grid construction
+    i = wp.tid()
+    d = sdf[i]
+    abs_sdf = wp.abs(d)
+    level = wp.min(abs_sdf / surface_band, 1.0)
+    if d > exterior_carve:
+        refinement[i] = 1.0
+    else:
+        refinement[i] = level
+
+
 @wp.kernel
 def mesh_sdf_kernel(
     mesh: wp.uint64,
@@ -307,8 +357,52 @@ class Clay:
         self.tri_mesh = None
         self.tri_vtx_quadrature = None
         self.rest_points = None
+        self.cubes = None  # hex vertex indices matching the adaptive FEM cells
+        self.sim_vol = None  # coarse NanoVDB box used as the adaptivity root
+        self.level_count = None
+        self.surface_band = None
+        self.exterior_carve = None
 
         self._sim_initialized = False
+
+    def rebuild_adaptive_grid(self, grid_sdf):
+        """Rebuild AdaptiveNanogrid from the current sculpted nodal SDF."""
+        old_geo = self.geo
+        old_sdf_field = fem.make_polynomial_space(old_geo).make_field()
+        old_sdf_field.dof_values = grid_sdf  # SDF lives on the previous adaptive vertices
+
+        # convert sculpted SDF -> refinement levels on the same nodes
+        ref_field = fem.make_polynomial_space(old_geo).make_field()
+        wp.launch(
+            sdf_to_refinement_kernel,
+            dim=grid_sdf.shape[0],
+            inputs=[grid_sdf, self.surface_band, self.exterior_carve, ref_field.dof_values],
+        )
+
+        new_geo = fem.adaptivity.adaptive_nanogrid_from_field(
+            self.sim_vol,
+            self.level_count,
+            refinement_field=ref_field,
+            grading="face",
+        )
+
+        new_space = fem.make_polynomial_space(new_geo)
+        new_sdf_field = new_space.make_field()
+        new_sdf_field.dof_values.fill_(1.0)  # far-outside default for nodes that miss the old grid
+        fem.interpolate(
+            fem.NonconformingField(fem.Cells(new_geo), old_sdf_field),
+            dest=new_sdf_field,
+            kernel_options={"enable_backward": False},
+        )
+
+        self.geo = new_geo
+        self.cubes = new_space.topology.element_node_indices()
+        debug_print(
+            "Rebuilt adaptive grid:",
+            f"cell_count={new_geo.cell_count()}",
+            f"vertex_count={new_geo.vertex_count()}",
+        )
+        return new_space.node_positions(), new_sdf_field.dof_values
 
     def create_sim(self, flexicubes, sim_class):
         prev_sim = self.sim
@@ -324,7 +418,7 @@ class Clay:
         self.sim = sim_from_flexicubes(
             sim_class,
             flexicubes,
-            geo,
+            self.geo,
             args,
             quadrature_model=args.quadrature_model,
         )
@@ -510,6 +604,7 @@ def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.a
         nonlocal prev_world_pos, force_center_quadrature, frame_id, flexicubes_data, sculpt_rebuild_count
         nonlocal tear_threshold_reached
         nonlocal show_voxel_grid, show_voxel_nodes, show_voxel_cells
+        nonlocal grid_node_pos, grid_sdf
 
         io = psim.GetIO()
 
@@ -559,8 +654,9 @@ def setup_interactive_viewer(clay: Clay, grid_node_pos: wp.array, grid_sdf: wp.a
                         inputs=[amount, falloff, rest_pos, grid_node_pos, grid_sdf],
                     )
 
-                    # rebuilds flexicubes structure and recreate sim
-                    flexicubes_data = flexicubes_from_sdf_grid(res, grid_sdf, grid_node_pos)
+                    # re-adapt the FEM/FlexiCubes hex grid to the sculpted SDF, then extract a new surface
+                    grid_node_pos, grid_sdf = clay.rebuild_adaptive_grid(grid_sdf)
+                    flexicubes_data = flexicubes_from_sdf_grid(res, grid_sdf, grid_node_pos, cube_idx=clay.cubes)
                     sculpt_rebuild_count += 1
                     if sculpt_rebuild_count == 1 or sculpt_rebuild_count % 10 == 0:
                         debug_print(
@@ -757,6 +853,7 @@ if __name__ == "__main__":
         help="Path to the saved neural quadrature MLP weights. If not provided, use regular quadrature",
     )
     parser.add_argument("--resolution", type=int, default=64, help="Grid resolution (at finest level)")
+    parser.add_argument("--level_count", type=int, default=3, help="Number of adaptive refinement levels")
     parser.add_argument(
         "--force_scale",
         type=float,
@@ -812,6 +909,7 @@ if __name__ == "__main__":
         f"variant={class_args.variant}",
         f"mesh={args.mesh}",
         f"resolution={args.resolution}",
+        f"level_count={args.level_count}",
         f"quadrature_model={args.quadrature_model}",
         f"matrix_free={getattr(args, 'matrix_free', None)}",
     )
@@ -821,16 +919,45 @@ if __name__ == "__main__":
     args.ground_height = -1
     args.collision_radius = 0.5 / args.resolution
 
-    res = args.resolution
+    res = args.resolution  # finest-level resolution requested by the user
+    level_count = args.level_count  # how many times the coarse volume may be split
+    coarse_res_i = max(res // (1 << (level_count - 1)), 2)  # coarse voxel count along each axis
+    coarse_res = wp.vec3i(coarse_res_i, coarse_res_i, coarse_res_i)  # coarse grid resolution as a vec3i
+    bounds_lo = wp.vec3(-1.0)  # world-space lower corner of the simulation box
+    bounds_hi = wp.vec3(1.0)  # world-space upper corner of the simulation box
 
-    # Regular grid for evaluating sdf
-    geo = fem.Grid3D(res=wp.vec3i(res), bounds_lo=wp.vec3(-1), bounds_hi=wp.vec3(1))
-    debug_print("Created grid:", f"resolution={res}", f"cell_count={res ** 3}")
+    # coarse simulation volume as a Warp NanoVDB (dense box of coarse voxels)
+    sim_vol = fem_example_utils.gen_volume(res=coarse_res, bounds_lo=bounds_lo, bounds_hi=bounds_hi)
 
     # sample mesh SDF on grid nodes
-    source_mesh = load_normalized_mesh(args.mesh)
-    grid_node_pos = fem.make_polynomial_space(geo).node_positions()
-    grid_sdf = wp.empty(grid_node_pos.shape[0], dtype=float)
+    source_mesh = load_normalized_mesh(args.mesh)  # load and normalize the input surface first (needed for refinement)
+
+    surface_band = 4.0 / float(res)  # world distance that maps to the finest level
+    exterior_carve = 8.0 / float(res)  # drop exterior voxels farther than this from the surface
+    refinement = fem.ImplicitField(  # wrap the refinement oracle as a FEM field on the coarse nanogrid
+        domain=fem.Cells(fem.Nanogrid(sim_vol)),  # treat the coarse NanoVDB box as FEM cells
+        func=refinement_field,  # evaluate signed-distance-based refinement at sample points
+        values={"mesh": source_mesh.id, "surface_band": surface_band, "exterior_carve": exterior_carve},
+    )
+
+    geo = fem.adaptivity.adaptive_nanogrid_from_field(  # build an adaptive hex grid from the coarse volume
+        sim_vol,  # coarse base grid; no voxels are added outside this box
+        level_count,  # maximum number of refinement levels
+        refinement_field=refinement,  # 0 = finest near the surface, 1 = coarsest, negative = carve
+        grading="face",  # keep neighboring cells within one level across shared faces
+    )
+    debug_print(
+        "Created adaptive grid:",
+        f"finest_resolution={res}",
+        f"coarse_resolution={coarse_res_i}",
+        f"level_count={level_count}",
+        f"cell_count={geo.cell_count()}",
+        f"vertex_count={geo.vertex_count()}",
+    )
+
+    node_space = fem.make_polynomial_space(geo)  # degree-1 space whose nodes are the adaptive hex vertices
+    grid_node_pos = node_space.node_positions()  # world-space positions of every adaptive grid node
+    grid_sdf = wp.empty(grid_node_pos.shape[0], dtype=float)  # per-node signed distance buffer
     debug_print("Sampling mesh SDF:", f"grid_nodes={grid_node_pos.shape[0]}")
     wp.launch(
         mesh_sdf_kernel,
@@ -839,8 +966,16 @@ if __name__ == "__main__":
     )
     debug_print("Finished sampling mesh SDF")
 
+    cubes = node_space.topology.element_node_indices()  # 8 vertex indices per adaptive cell, matching FEM cell order
+
     # Create flexicube data from sdf grid
-    fc_data = flexicubes_from_sdf_grid(res, grid_node_pos=grid_node_pos, grid_node_sdf=grid_sdf, sdf_grad_func=None)
+    fc_data = flexicubes_from_sdf_grid(
+        res,
+        grid_node_pos=grid_node_pos,
+        grid_node_sdf=grid_sdf,
+        sdf_grad_func=None,
+        cube_idx=cubes,  # use adaptive hex connectivity instead of a dense uniform voxel lattice
+    )
     debug_print(
         "Created flexicubes:",
         f"surface_vertices={len(fc_data.tri_vertices)}",
@@ -849,6 +984,11 @@ if __name__ == "__main__":
 
     # Create simulation
     clay = Clay(geo)
+    clay.cubes = cubes  # hex indices matching the adaptive FEM cells
+    clay.sim_vol = sim_vol  # reuse the same coarse box when re-adapting after sculpt
+    clay.level_count = level_count
+    clay.surface_band = surface_band
+    clay.exterior_carve = exterior_carve
     clay.create_sim(fc_data, sim_class=sim_class)
 
     # Setup interactive viewer and run simulation

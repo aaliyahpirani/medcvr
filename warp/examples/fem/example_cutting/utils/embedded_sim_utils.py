@@ -187,6 +187,7 @@ def flexicubes_from_sdf_grid(
     sdf_grad_func=None,
     output_tetmesh=False,
     device="cuda",
+    cube_idx=None,
 ):
     """Creates and serialize a Flexicubes datastructure from a SDF discretized on a dense grid.
     
@@ -196,6 +197,8 @@ def flexicubes_from_sdf_grid(
         grid_node_pos: the positions of the grid node
         sdf_grad_func: the gradient of the sdf function
         output_tetmesh: whether to output a tetrahedral mesh 
+        cube_idx: hex connectivity indices. if omitted, a dense regular lattice is created, but if
+        passed those cubes are used instead. 
     Returns:
         FcData: an object that contains the flexicubes data
     """
@@ -210,8 +213,15 @@ def flexicubes_from_sdf_grid(
 
         # create a flexicubes object 
         fc = FlexiCubes(device)
-        # construct a voxel grid of the correct resolution 
-        _x_nx3, cube_fx8 = fc.construct_voxel_grid(res)
+        # construct a voxel grid of the correct resolution, or reuse adaptive-cell hex indices
+        if cube_idx is None:
+            _x_nx3, cube_fx8 = fc.construct_voxel_grid(res)
+        elif torch.is_tensor(cube_idx):
+            cube_fx8 = cube_idx.to(device=device, dtype=torch.long)
+        elif isinstance(cube_idx, wp.array):
+            cube_fx8 = wp.to_torch(cube_idx).to(device=device, dtype=torch.long)
+        else:
+            cube_fx8 = torch.as_tensor(cube_idx, dtype=torch.long, device=device)
 
         # initialize weights to 0
         weight = torch.zeros((cube_fx8.shape[0], 21), dtype=torch.float, device=device)
